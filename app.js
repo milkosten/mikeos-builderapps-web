@@ -915,6 +915,25 @@ function assistantBeatBubble(b) {
   bubble.appendChild(el("div", { class: "aa-sub" },
     trigger + (b.ts ? " · " + fmtDate(b.ts) : "") + " · " + outcome));
 
+  // WHAT was asked, verbatim. "you asked · 11m ago" without the words is useless: hours
+  // later nobody remembers what they told it, and a beat can only be judged against the
+  // instruction it was given. It comes off the beat row itself (server-owned, so it
+  // survives a reload) rather than being matched up with the chat thread by guesswork.
+  const ask = String(b.user_ask || "").trim();
+  if (ask) {
+    bubble.appendChild(el("div", { class: "aa-ask" },
+      el("div", { class: "aa-ask-lbl" }, "you asked"),
+      el("div", { class: "aa-ask-txt" }, ask)));
+  }
+
+  // The assistant's own conclusion, in full and in the open. This is the single most
+  // valuable thing a beat produces — and the only way to notice it reasoning confidently
+  // and WRONGLY (one beat concluded "an SSL error is an ingress-layer certificate issue"
+  // when the real cause was its own CSP). A conclusion you have to hover to finish reading
+  // is a conclusion nobody checks.
+  const thought = String(b.thought || "").trim();
+  if (thought) bubble.appendChild(expandable(thought, "aa-thought", 1400));
+
   const lines = Array.isArray(b.activity) ? b.activity : [];
   if (lines.length) {
     const list = el("div", { class: "aa-lines" });
@@ -931,6 +950,27 @@ function assistantBeatBubble(b) {
     bubble);
 }
 
+// Text that is READABLE by default. Under `limit` it is simply rendered whole; over it,
+// the first `limit` characters plus an explicit "Show more" the user can click.
+//
+// What this replaces: a CSS line-clamp with the remainder on the element's `title`. That is
+// not a way to read anything — it is a hover tooltip that appears after a delay, vanishes
+// on the smallest mouse movement, cannot be selected or copied, and does not exist at all
+// on a touch screen. An assistant's reasoning arrived that way and was, in practice,
+// invisible. Nothing an agent reported should need a hover to be read.
+function expandable(str, cls, limit) {
+  const full = String(str == null ? "" : str);
+  const box = el("div", { class: cls });
+  if (full.length <= limit) { box.textContent = full; return box; }
+  const head = document.createTextNode(full.slice(0, limit) + "… ");
+  const more = el("button", { class: "show-more", type: "button", onclick: () => {
+    box.textContent = full;                 // in place: no repaint, no lost scroll position
+  } }, "Show more");
+  box.appendChild(head);
+  box.appendChild(more);
+  return box;
+}
+
 // One harness line. `icon` is picked SERVER-SIDE — render it as given rather than
 // re-deciding here, so the pane says exactly what the backend reported.
 const ACTIVITY_KINDS = ["phase", "tool", "text", "result"];
@@ -941,11 +981,19 @@ function activityLine(ln) {
   if (kind === "result" && ln.ok === false) cls += " bad";
   const text = ln.text == null ? "" : String(ln.text);
   const detail = ln.detail == null ? "" : String(ln.detail);
-  const body = el("div", { class: "aa-body" }, el("span", { class: "aa-text" }, text));
-  // `detail` can be a whole tool payload; keep it secondary and clamped, with the full
-  // text on hover so nothing the assistant reported is actually lost.
-  if (detail) body.appendChild(el("div", { class: "aa-detail" }, detail));
-  return el("div", { class: cls, title: detail || text },
+  const body = el("div", { class: "aa-body" });
+  // A "text" line is the agent SPEAKING — its reasoning — and older beats have it split
+  // across text+detail (the container used to cut it at 300 chars, mid-word). Rejoin the
+  // two and render the result as one readable paragraph, never clamped.
+  if (kind === "text") {
+    body.appendChild(expandable((text + " " + detail).trim(), "aa-text", 1400));
+  } else {
+    body.appendChild(el("span", { class: "aa-text" }, text));
+    // `detail` on a tool line can be a whole payload — secondary, but still readable
+    // rather than hover-only.
+    if (detail) body.appendChild(expandable(detail, "aa-detail", 300));
+  }
+  return el("div", { class: cls },
     el("span", { class: "aa-icon" }, String(ln.icon || "·")),
     body,
     ln.ts ? el("span", { class: "aa-ts" }, String(ln.ts)) : null);
@@ -1236,6 +1284,35 @@ function scrollThread() {
   if (t) t.scrollTop = t.scrollHeight;
 }
 
+// ----- landing a freshly-opened thread on the NEWEST message -----
+// Opening a project is not the same event as repainting one, and they want opposite
+// behaviour. repaintLeft() preserves the reader's place — correct, or a poll tick would
+// yank you out of the history you are reading. But that rule was also governing the FIRST
+// paint after hydration, where it pinned a long thread to the top and left the newest
+// message several screens below. Every chat client opens at the bottom; so does this one.
+//
+// It has to run after the content is actually laid out: at the moment render() returns,
+// the thread's scrollHeight is still ~0 and setting scrollTop silently does nothing. Hence
+// a frame-later pass, plus two later ones for the pieces that hydrate asynchronously
+// (steps from /steps, assistant beats from /assistant-activity).
+//
+// And it must not fight the user: each pass remembers where it left the scroller, and
+// stops the moment that value has moved — i.e. as soon as a human has scrolled at all.
+let _landedAt = -1;
+function landThreadAtBottom() {
+  _landedAt = -1;
+  const jump = () => {
+    const t = document.getElementById("chat-thread");
+    if (!t) return;
+    if (_landedAt >= 0 && Math.abs(t.scrollTop - _landedAt) > 2) return;  // the reader moved
+    t.scrollTop = t.scrollHeight;
+    _landedAt = t.scrollTop;
+  };
+  requestAnimationFrame(() => { jump(); requestAnimationFrame(jump); });
+  setTimeout(jump, 150);
+  setTimeout(jump, 600);
+}
+
 // ----- right panel: status pill + live preview iframe -----
 function statusPill(status) {
   const s = (status || "unknown").toLowerCase();
@@ -1322,7 +1399,11 @@ function activitySig(feed) {
   return beats.map((b) => {
     const acts = (b && b.activity) || [];
     const last = acts.length ? acts[acts.length - 1] : null;
+    // `thought` and `user_ask` are RENDERED, so they belong in the signature: the thought
+    // is written when the beat finishes, and without it here the gate would suppress the
+    // very repaint that puts the assistant's conclusion on screen.
     return [b && b.beat_id, b && b.assistant_id, b && b.status, b && b.cost_usd, acts.length,
+            (b && b.thought || "").length, (b && b.user_ask || "").length,
             last && last.text, last && last.ts, last && last.ok].join("~");
   }).join("|");
 }
@@ -3038,6 +3119,12 @@ async function enterProject(id, { navigate = true } = {}) {
   state.runHistory = runToHistory(proj.latest_run);
   state.hydrating = false;
   render();
+  // Opening a project lands on the NEWEST message, like any chat client. This is the one
+  // paint where repaintLeft()'s preserve-the-reader's-place rule is wrong (see
+  // landThreadAtBottom): messages and steps have just been restored from the server and
+  // nobody has read anything yet, so the top of a months-long thread is the worst possible
+  // place to be put. Called after render() so the content exists to scroll past.
+  landThreadAtBottom();
 
   // The executed step list is NOT allowed to depend on the project row carrying
   // latest_run.steps. If it didn't, ask the dedicated endpoint and paint them in.
