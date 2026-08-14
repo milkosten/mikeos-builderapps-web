@@ -3996,6 +3996,16 @@ function activityIsHot() {
 function scheduleActivityPoll(delay) {
   stopActivityPoll();
   if (activityAbsent || state.view !== "builder" || !state.project) return;
+  // THE SOCKET OWNS THE FEED WHILE IT IS UP. Not merely "stop the timer" — the guard has to
+  // be HERE, at the single point where the chain re-arms, because `activityTick` re-arms
+  // unconditionally when its fetch returns. A tick already in the air when the socket
+  // connected would otherwise resurrect the whole chain a moment after it was stood down,
+  // and the pane would go on polling for ever behind a perfectly healthy WebSocket — which
+  // is exactly what it did, and it is invisible unless you go and count the requests.
+  //
+  // `down()` clears wsLive and calls ensureActivityPoll, so a dropped socket resumes polling
+  // on the next line of execution. There is never a window with neither.
+  if (state.wsLive) return;
   const ms = delay != null ? delay
     : (activityIsHot() && !activityMisses ? ACTIVITY_HOT_MS : ACTIVITY_IDLE_MS);
   activityTimer = setTimeout(activityTick, ms);
