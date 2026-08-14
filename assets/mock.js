@@ -22,6 +22,18 @@ const PIPELINE_STEPS = [
   "Finalize",
 ];
 
+// Executed steps for a finished/partial run, so the mock exercises the same
+// "replay history from the server" path the live API drives.
+function mockSteps(upTo, { running = false } = {}) {
+  return PIPELINE_STEPS.slice(0, upTo).map((name, idx) => ({
+    idx,
+    name: name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, ""),
+    status: running && idx === upTo - 1 ? "running" : "done",
+    log: running && idx === upTo - 1 ? "working…" : "ok",
+    ts: new Date(Date.now() - (upTo - idx) * 60e3).toISOString(),
+  }));
+}
+
 const store = new Map();
 
 // Server-side chat threads (the mock stand-in for PUT/GET .../messages).
@@ -204,7 +216,9 @@ function seed() {
     created_at: new Date(Date.now() - 3 * 864e5).toISOString(),
     updated_at: new Date(Date.now() - 3600e3).toISOString(),
     latest_run: { kind: "create", status: "done", current_step: PIPELINE_STEPS.length,
-                  total_steps: PIPELINE_STEPS.length },
+                  total_steps: PIPELINE_STEPS.length,
+                  request: "A recipe box where I add recipes with a title and body.",
+                  steps: mockSteps(PIPELINE_STEPS.length) },
   });
   store.set("demo02", {
     id: "demo02", title: "URL Shortener", status: "building", subdomain: "demo02",
@@ -213,7 +227,10 @@ function seed() {
     pipeline: "create", repo: "milkosten/app-demo02",
     created_at: new Date(Date.now() - 1200e3).toISOString(),
     updated_at: new Date(Date.now() - 120e3).toISOString(),
-    latest_run: { kind: "create", status: "running", current_step: 7, total_steps: PIPELINE_STEPS.length },
+    latest_run: { kind: "create", status: "running", current_step: 7,
+                  total_steps: PIPELINE_STEPS.length,
+                  request: "A URL shortener with click analytics.",
+                  steps: mockSteps(7, { running: true }) },
   });
 }
 seed();
@@ -349,7 +366,8 @@ export const mockApi = {
     store.set(id, p);
     await streamPipeline(p, onEvent);
     p.latest_run = { kind: "create", status: "done", current_step: PIPELINE_STEPS.length,
-                     total_steps: PIPELINE_STEPS.length };
+                     total_steps: PIPELINE_STEPS.length, request: prompt,
+                     steps: mockSteps(PIPELINE_STEPS.length) };
   },
 
   async updateProjectStream(id, request, onEvent) {
@@ -359,6 +377,10 @@ export const mockApi = {
                    "Rebuild the app", "Deploy the stack", "Runtime QA", "Finalize"];
     p.status = "building";
     await streamPipeline(p, onEvent, { steps });
-    p.latest_run = { kind: "update", status: "done", current_step: steps.length, total_steps: steps.length };
+    p.latest_run = { kind: "update", status: "done", current_step: steps.length,
+                     total_steps: steps.length, request,
+                     steps: steps.map((name, idx) => ({
+                       idx, name: name.toLowerCase().replace(/[^a-z0-9]+/g, "_"),
+                       status: "done", log: "ok", ts: new Date().toISOString() })) };
   },
 };
