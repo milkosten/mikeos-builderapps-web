@@ -903,15 +903,28 @@ function repaintRight() {
 // 4s whether or not anything changed; repainting on every tick made the panel visibly
 // "flip" and yanked the reader back to the bottom mid-sentence. Repaint only when this
 // changes — i.e. only when there is genuinely something new to show.
+// The step objects the LEFT PANEL renders are `runToHistory()`'s shape —
+// {label, pending, failed} — not the API's {name, status, log}, and `state.runHistory` is
+// one OBJECT ({kind, request, status, steps}), not an array. The first version of this
+// signature read `.name`/`.status` off the former and called `.map` on the latter, so it
+// threw on every call and fell into the catch below, returning a fresh random string each
+// tick: the gate was inert and the panel still rebuilt every 4 seconds. Describe both shapes
+// (fields the other shape simply lacks read as undefined, which is harmless).
+function stepSig(arr) {
+  return (arr || []).map((s) => [s.label, s.name, s.status, !!s.pending, !!s.failed,
+                                 (s.log || "").length].join("~")).join("|");
+}
+
 function leftSignature() {
   try {
+    const rh = state.runHistory;
     return JSON.stringify({
       p: state.project && state.project.id,
       s: state.project && state.project.status,
       g: state.generating,
-      m: (state.messages || []).map((m) => [m.role, m.text, m.kind,
-        (m.steps || []).map((s) => s.name + ":" + s.status + ":" + (s.log || "").length)]),
-      r: (state.runHistory || []).map((s) => s.name + ":" + s.status),
+      h: state.hydrating,
+      m: (state.messages || []).map((m) => [m.role, m.text, m.kind, stepSig(m.steps)]),
+      r: rh ? [rh.kind, rh.status, rh.request, stepSig(rh.steps)] : null,
     });
   } catch { return String(Math.random()); }   // never suppress a paint on an error
 }
