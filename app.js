@@ -241,12 +241,13 @@ function chatIntro() {
   const chips = el("div", { class: "chat-examples" });
   for (const ex of EXAMPLE_PROMPTS) {
     chips.appendChild(el("button", { class: "chat-chip", disabled: state.generating,
-      title: "Build this", onclick: () => sendMessage(ex) }, ex));
+      title: "Use this prompt", onclick: () => fillComposer(ex) }, ex));
   }
   return el("div", { class: "msg assistant" },
     el("div", { class: "avatar" }, "B"),
     el("div", { class: "bubble" },
-      el("p", {}, "Hi! Describe the app you want and I'll build it live — a real Node + Postgres app, deployed to its own URL. Watch each pipeline step stream in. Some ideas:"),
+      el("h2", { class: "intro-hero" }, "What do you want to build today?"),
+      el("p", {}, "Describe an app and watch it get built, deployed, and live — a real Node + Postgres + Redis app on its own URL. Watch each pipeline step stream in. Some ideas:"),
       chips));
 }
 
@@ -375,6 +376,17 @@ function placeholder() {
 // ---------- actions ----------
 async function loadProjects() {
   await guard(async () => { state.projects = (await api.listProjects()) || []; });
+}
+
+// Populate the composer with an example prompt (chips don't auto-send — the user
+// can tweak the wording, then press Send).
+function fillComposer(text) {
+  const ta = document.getElementById("prompt");
+  if (!ta) return;
+  ta.value = text;
+  autoGrow(ta);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
 }
 
 // The one entry point for the composer (and example chips). First message with no

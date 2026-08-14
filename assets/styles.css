@@ -117,6 +117,9 @@ a { color: var(--accent); }
 .spin.sm { width: 12px; height: 12px; border-width: 2px; margin-top: 4px; flex: 0 0 12px;
   border-color: rgba(109,139,255,.35); border-top-color: var(--accent); }
 
+/* empty-state intro hero heading */
+.intro-hero { font-size: 19px; font-weight: 700; letter-spacing: -.01em; margin: 0 0 8px; color: var(--text); }
+
 /* empty-state intro chips */
 .chat-examples { display: flex; flex-direction: column; gap: 7px; margin-top: 10px; }
 .chat-chip {
