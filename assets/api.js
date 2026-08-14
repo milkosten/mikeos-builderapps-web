@@ -144,6 +144,23 @@ const live = {
   projectEnv:         (id)     => sub(id, "env"),
   lifecycle:     (id, action)  =>
     req("POST", `/api/projects/${encodeURIComponent(id)}/lifecycle`, { action }),
+
+  // --- per-project AI assistants (phase 29) ---
+  // The catalog is templates + the capability vocabulary. It is NOT a list of allowed
+  // roles — `role` is free text and the API accepts anything; the templates only pre-fill.
+  assistantsCatalog: ()        => req("GET", "/api/assistants/catalog"),
+  assistants:        (id)      => sub(id, "assistants"),
+  createAssistant:   (id, body) =>
+    req("POST", `/api/projects/${encodeURIComponent(id)}/assistants`, body),
+  assistant:         (id, aid) => sub(id, `assistants/${aid}`),
+  patchAssistant:    (id, aid, body) =>
+    req("PATCH", `/api/projects/${encodeURIComponent(id)}/assistants/${aid}`, body),
+  deleteAssistant:   (id, aid) =>
+    req("DELETE", `/api/projects/${encodeURIComponent(id)}/assistants/${aid}`),
+  // action ∈ start | pause | beat  ("beat" returns as soon as the beat row exists)
+  assistantAction:   (id, aid, action) =>
+    req("POST", `/api/projects/${encodeURIComponent(id)}/assistants/${aid}/${action}`, {}),
+  assistantBeats:    (id, aid) => sub(id, `assistants/${aid}/beats`),
 };
 
 // The exported client picks live or mock at module-load time.

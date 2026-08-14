@@ -37,6 +37,14 @@ const state = {
   secretsRevealed: false,
   logsAuto: false,
   danger: { busy: false, confirm: "" },
+  // ----- Assistants tab (phase 29) -----
+  asstCatalog: null,  // { templates:[...], capabilities:[...], limits } — fetched once
+  asstSel: null,      // id of the assistant whose detail pane is open (null = the card grid)
+  asstDetail: null,   // { id, loading, error, data }  (data includes soul_md + beats)
+  asstSoulDraft: null,// unsaved SOUL editor text; null means "showing what the server has"
+  asstDialog: null,   // the "+ Start an assistant" form, or null when closed
+  asstBusy: false,    // an assistant action is in flight (disables the buttons)
+  asstPoll: null,     // interval id: a running beat is polled until it finishes
 
   // Executed pipeline steps rebuilt FROM THE SERVER (latest_run.steps) on load.
   // Kept out of state.messages so it never pollutes the persisted thread.
@@ -846,6 +854,9 @@ function statusPill(status) {
 const TABS = {
   site:        { label: "Site",         pinned: true,  icon: "▤" },
   goals:       { label: "Goals",        pinned: true,  icon: "◎" },
+  // Pinned deliberately: an assistant you have to go looking for in the "+" menu is an
+  // assistant nobody starts.
+  assistants:  { label: "Assistants",   pinned: true,  icon: "✦" },
   code:        { label: "Code",         pinned: true,  icon: "‹›" },
   database:    { label: "Database",     pinned: true,  icon: "▤" },
   secrets:     { label: "Secrets",      pinned: true,  icon: "🔑" },
@@ -1032,6 +1043,7 @@ document.addEventListener("click", () => {
 // chat or the preview.
 const TAB_FETCH = {
   goals:       (id) => api.projectDocs(id),
+  assistants:  (id) => api.assistants(id),
   code:        (id) => api.projectFiles(id, state.codePath || ""),
   database:    (id) => api.projectDatabase(id),
   secrets:     (id) => api.projectSecrets(id, state.secretsRevealed),
@@ -1147,6 +1159,7 @@ function tabBody(tab) {
   switch (tab) {
     case "site":        return siteTab();
     case "goals":       return goalsTab();
+    case "assistants":  return assistantsTab();
     case "code":        return codeTab();
     case "database":    return databaseTab();
     case "secrets":     return secretsTab();
@@ -1542,6 +1555,544 @@ function envTab() {
       el("button", { class: "btn ghost sm", onclick: () => copyText(String(e.value ?? "")) }, "Copy")));
     return tabPane(list);
   });
+}
+
+// ===================== Assistants (phase 29) =====================
+// Per-project closed-loop agents: SOUL.md persona + a heartbeat + a granted capability set.
+//
+// The two things this UI must never quietly contradict:
+//   1. ROLES ARE OPEN-ENDED. The template picker is a set of PRE-FILLS; `role` is a free
+//      text input the user can type anything into, and the API accepts anything. There is no
+//      dropdown of allowed roles anywhere in here, by design.
+//   2. CAPABILITIES ARE WHAT IS ENFORCED, not the role name. The toggles below are the real
+//      grant; the ones that are off by default say so, and say why.
+//
+// v1 scope is stated on screen rather than faked — unattended code edits / deploys exist but
+// default OFF, and assistant-to-assistant messaging is not built.
+
+const ASST_V1_NOTE =
+  "Scaffolding, honestly labelled. Comment / QA / doc work is wired end to end. " +
+  "Edit code, Commit & push and Request a deploy exist and are enforced, but default OFF — " +
+  "unattended code changes need the quota + guard work first. Assistants cannot message each " +
+  "other yet; that is not built.";
+
+function fmtInterval(m) {
+  m = Number(m) || 0;
+  if (m < 60) return "every " + m + " min";
+  if (m % 60 === 0 && m < 1440) return "every " + (m / 60) + " h";
+  if (m % 1440 === 0) return "every " + (m / 1440) + " d";
+  return "every " + Math.round(m / 60) + " h";
+}
+
+function asstStatusPill(a) {
+  if (a.beating) return el("span", { class: "status-pill s-building" }, "Beating…");
+  return a.status === "active"
+    ? el("span", { class: "status-pill s-live" }, "Active")
+    : el("span", { class: "status-pill s-stopped" }, "Paused");
+}
+
+// A capability chip. `granted` drives the styling; the title carries the plain-English
+// explanation of what it actually permits.
+function capChip(id, granted, meta) {
+  const label = (meta && meta.label) || id;
+  return el("span", { class: "cap-chip" + (granted ? " on" : ""),
+    title: (meta && meta.detail) || id }, label);
+}
+
+function capMeta(id) {
+  const caps = (state.asstCatalog && state.asstCatalog.capabilities) || [];
+  return caps.find((c) => c.id === id) || { id, label: id, detail: "" };
+}
+
+async function loadAsstCatalog() {
+  if (state.asstCatalog) return state.asstCatalog;
+  try { state.asstCatalog = await api.assistantsCatalog(); }
+  catch { state.asstCatalog = { templates: [], capabilities: [], limits: {} }; }
+  return state.asstCatalog;
+}
+
+function assistantsTab() {
+  // The catalog is needed for capability labels + the dialog; fetch once, lazily.
+  if (!state.asstCatalog) setTimeout(() => loadAsstCatalog().then(() => {
+    if (state.tab === "assistants") repaintRight();
+  }), 0);
+
+  if (state.asstSel) return assistantDetail();
+
+  return withTab("assistants", (data) => {
+    const rows = data.assistants || [];
+    const bar = tabToolbar(
+      el("button", { class: "btn primary sm", onclick: () => openAsstDialog() },
+        "＋ Start an assistant"),
+      el("div", { class: "spacer" }),
+      el("span", { class: "muted-note asst-count" },
+        rows.length ? rows.length + (rows.length === 1 ? " assistant" : " assistants") : ""));
+
+    const note = el("div", { class: "asst-note" },
+      el("span", { class: "asst-note-mark" }, "◐"),
+      el("span", {}, ASST_V1_NOTE));
+
+    if (!rows.length) {
+      return tabPane(bar, note, el("div", { class: "tab-empty" },
+        el("div", { class: "te-mark" }, "✦"),
+        el("div", { class: "te-text" },
+          "No assistants yet. An assistant is a closed-loop agent attached to this project: "
+          + "it has a SOUL.md, a heartbeat, and only the capabilities you grant it."),
+        el("button", { class: "btn primary sm", onclick: () => openAsstDialog() },
+          "＋ Start an assistant")),
+        state.asstDialog ? assistantDialog() : null);
+    }
+
+    const grid = el("div", { class: "asst-grid" }, rows.map(assistantCard));
+    return tabPane(bar, note, grid, state.asstDialog ? assistantDialog() : null);
+  });
+}
+
+function assistantCard(a) {
+  const caps = a.capabilities || [];
+  const last = a.last_beat;
+  return el("div", { class: "asst-card" + (a.status === "active" ? " live" : "") },
+    el("div", { class: "asst-card-head" },
+      el("div", { class: "asst-role" }, a.role || "Assistant"),
+      asstStatusPill(a)),
+    el("div", { class: "asst-name" }, a.name || a.role || "Assistant"),
+    a.description ? el("div", { class: "asst-desc" }, a.description) : null,
+    el("div", { class: "asst-caps" },
+      caps.length ? caps.map((c) => capChip(c, true, capMeta(c)))
+                  : el("span", { class: "asst-dim" }, "no capabilities granted")),
+    el("div", { class: "asst-meta" },
+      el("span", { title: "Heartbeat interval" }, "♥ " + fmtInterval(a.interval_minutes)),
+      el("span", { title: "Last beat" },
+        "last: " + (a.last_beat_at ? fmtDate(a.last_beat_at) : "never")),
+      el("span", { title: "Next scheduled beat" },
+        "next: " + (a.status !== "active" ? "paused"
+                    : a.next_beat_at ? fmtDate(a.next_beat_at) : "—"))),
+    last && last.thought
+      ? el("div", { class: "asst-last" },
+          el("span", { class: "asst-last-lbl" }, "last thought"),
+          el("span", { class: "asst-last-txt" }, String(last.thought).slice(0, 180)))
+      : null,
+    el("div", { class: "asst-actions" },
+      el("button", { class: "btn sm", disabled: state.asstBusy,
+        onclick: () => assistantAct(a.id, "beat") }, "▶ Beat now"),
+      el("button", { class: "btn sm", disabled: state.asstBusy,
+        onclick: () => assistantAct(a.id, a.status === "active" ? "pause" : "start") },
+        a.status === "active" ? "❚❚ Pause" : "▶ Start"),
+      el("button", { class: "btn ghost sm", onclick: () => selectAssistant(a.id) },
+        "Open ›")));
+}
+
+// ---------- detail: SOUL editor + beat timeline ----------
+function assistantDetail() {
+  const d = state.asstDetail;
+  const back = el("button", { class: "btn ghost sm", onclick: () => {
+    state.asstSel = null; state.asstDetail = null; state.asstSoulDraft = null;
+    stopBeatPoll(); repaintRight(); loadTab("assistants", { force: true });
+  } }, "‹ All assistants");
+
+  if (!d || d.loading) return tabPane(tabToolbar(back), tabLoading());
+  if (d.error) return tabPane(tabToolbar(back),
+    tabError(d.error, () => loadAssistantDetail(state.asstSel, true)));
+
+  const a = d.data || {};
+  const caps = a.capabilities || [];
+  const allCaps = (state.asstCatalog && state.asstCatalog.capabilities) || [];
+
+  const head = tabToolbar(back, el("div", { class: "spacer" }),
+    el("button", { class: "btn sm", disabled: state.asstBusy,
+      onclick: () => assistantAct(a.id, "beat") }, "▶ Beat now"),
+    el("button", { class: "btn sm", disabled: state.asstBusy,
+      onclick: () => assistantAct(a.id, a.status === "active" ? "pause" : "start") },
+      a.status === "active" ? "❚❚ Pause" : "▶ Start"),
+    el("button", { class: "btn ghost sm danger-text",
+      onclick: () => deleteAssistant(a.id, a.name || a.role) }, "Delete"));
+
+  const ident = el("div", { class: "card-block" },
+    el("div", { class: "cb-head" },
+      el("span", { class: "cb-title" }, a.name || a.role || "Assistant"),
+      asstStatusPill(a),
+      el("span", { class: "asst-role-tag" }, a.role || "assistant")),
+    a.description ? el("p", { class: "cb-note" }, a.description) : null,
+    el("div", { class: "kv-list" },
+      kv("Heartbeat", intervalEditor(a)),
+      kv("Capabilities", el("div", { class: "asst-caps wrap" },
+        allCaps.map((c) => capToggle(a, c, caps.includes(c.id))))),
+      kv("SOUL lives at", el("span", { class: "mono" }, a.soul_path || "—")),
+      kv("Last beat", a.last_beat_at ? fmtDate(a.last_beat_at) : "never"),
+      kv("Next beat", a.status !== "active" ? "paused (no beats scheduled)"
+                       : a.next_beat_at ? fmtDate(a.next_beat_at) : "—")));
+
+  return tabPane(head, ident, soulEditor(a), beatTimeline(a));
+}
+
+function kv(k, v) {
+  return el("div", { class: "kv-row" },
+    el("div", { class: "kv-key" }, k),
+    el("div", { class: "kv-val" }, v));
+}
+
+function intervalEditor(a) {
+  const inp = el("input", { type: "text", class: "asst-interval", inputmode: "numeric",
+    value: String(a.interval_minutes || 60) });
+  inp.value = String(a.interval_minutes || 60);
+  return el("div", { class: "asst-inline" }, inp, el("span", { class: "asst-dim" }, "minutes"),
+    el("button", { class: "btn sm", disabled: state.asstBusy, onclick: () =>
+      patchAssistant(a.id, { interval_minutes: Number(inp.value) || 60 }) }, "Save"));
+}
+
+// A capability toggle IS the grant. Clicking it PATCHes the assistant, so what you see on
+// screen is what the control plane will enforce on the next beat.
+function capToggle(a, cap, on) {
+  const risky = cap.safe_default === false;
+  return el("button", {
+    class: "cap-chip toggle" + (on ? " on" : "") + (risky ? " risky" : ""),
+    title: cap.detail + (risky ? "  —  off by default in v1: unattended writes need the "
+                                 + "quota + guard work first." : ""),
+    disabled: state.asstBusy,
+    onclick: () => {
+      const next = on ? (a.capabilities || []).filter((c) => c !== cap.id)
+                      : (a.capabilities || []).concat([cap.id]);
+      patchAssistant(a.id, { capabilities: next });
+    },
+  }, (on ? "✓ " : "＋ ") + cap.label + (risky ? " ⚠" : ""));
+}
+
+function soulEditor(a) {
+  const draft = state.asstSoulDraft;
+  const ta = el("textarea", { class: "soul-editor", spellcheck: "false",
+    placeholder: "# Who I am\n…" });
+  ta.value = draft != null ? draft : (a.soul_md || "");
+  ta.addEventListener("input", () => { state.asstSoulDraft = ta.value; dirty.disabled = false; });
+  const dirty = el("button", { class: "btn primary sm", disabled: draft == null,
+    onclick: () => patchAssistant(a.id, { soul_md: ta.value }, { soul: true }) }, "Save SOUL");
+  return el("div", { class: "card-block" },
+    el("div", { class: "cb-head" },
+      el("span", { class: "cb-title" }, "SOUL.md"),
+      el("div", { class: "spacer" }),
+      el("span", { class: "mono asst-dim" }, a.soul_path || ""),
+      dirty),
+    el("p", { class: "cb-note" },
+      "Who it is, what it optimises for, what it must never do, and how it decides a beat is "
+      + "worth acting on. Stored in Postgres today; it is mirrored into the repo at the path "
+      + "above once the assistant is granted Commit & push."),
+    ta);
+}
+
+function beatTimeline(a) {
+  const beats = a.beats || [];
+  const body = el("div", { class: "beat-list" });
+  if (!beats.length) {
+    body.appendChild(el("div", { class: "empty" },
+      "No beats yet. Press “Beat now” to run one immediately, or Start to let the heartbeat "
+      + "schedule them " + fmtInterval(a.interval_minutes) + "."));
+  }
+  for (const b of beats) body.appendChild(beatRow(b));
+  return el("div", { class: "card-block" },
+    el("div", { class: "cb-head" },
+      el("span", { class: "cb-title" }, "Beats"),
+      el("div", { class: "spacer" }),
+      el("button", { class: "btn ghost sm",
+        onclick: () => loadAssistantDetail(a.id, true) }, "↻ Refresh")),
+    el("p", { class: "cb-note" },
+      "One row per beat: what it perceived and concluded, what it did, and what the round "
+      + "cost. An idle assistant is visibly cheap; a runaway one is visibly expensive."),
+    body);
+}
+
+function beatRow(b) {
+  const st = String(b.status || "").toLowerCase();
+  const acts = b.actions || [];
+  const cost = Number(b.cost_usd || 0);
+  const head = el("div", { class: "beat-head" },
+    el("span", { class: "beat-dot s-" + st }, st === "running" ? "◍" : st === "failed" ? "✕" : "●"),
+    el("span", { class: "beat-when" }, fmtDate(b.ts) || String(b.ts || "")),
+    el("span", { class: "beat-kind" }, b.trigger_kind === "manual" ? "manual" : "scheduled"),
+    el("div", { class: "spacer" }),
+    b.duration_ms ? el("span", { class: "beat-stat" }, Math.round(b.duration_ms / 1000) + "s") : null,
+    b.tokens ? el("span", { class: "beat-stat" }, Number(b.tokens).toLocaleString() + " tok") : null,
+    cost ? el("span", { class: "beat-stat" }, "$" + cost.toFixed(4)) : null,
+    el("span", { class: "beat-status s-" + st }, st || "—"));
+
+  const kids = [head];
+  if (b.thought) kids.push(el("div", { class: "beat-thought" }, b.thought));
+  if (st === "running" && !b.thought) {
+    kids.push(el("div", { class: "beat-thought running" },
+      el("span", { class: "spin sm" }), " perceiving, reasoning, acting…"));
+  }
+  if (acts.length) {
+    const list = el("div", { class: "beat-acts" });
+    for (const a of acts) {
+      const r = a.result || {};
+      const ok = r.ok === true;
+      const denied = r.denied === true;
+      list.appendChild(el("div", { class: "beat-act" },
+        el("span", { class: "beat-act-kind" }, a.type || "?"),
+        el("span", { class: "beat-act-res " + (denied ? "denied" : ok ? "ok" : "bad") },
+          denied ? "refused — capability not granted"
+                 : ok ? (r.detail || cellText(shortResult(r)))
+                      : (r.detail || "failed"))));
+    }
+    kids.push(list);
+  }
+  if (b.log) {
+    const pre = el("pre", { class: "beat-log" }, b.log);
+    pre.style.display = "none";
+    kids.push(el("button", { class: "btn ghost sm beat-log-btn", onclick: () => {
+      pre.style.display = pre.style.display === "none" ? "block" : "none";
+    } }, "log"));
+    kids.push(pre);
+  }
+  return el("div", { class: "beat" }, ...kids);
+}
+
+// A tidy one-liner out of an action result object (never "[object Object]").
+function shortResult(r) {
+  const drop = new Set(["ok", "denied", "detail"]);
+  const keep = {};
+  for (const [k, v] of Object.entries(r || {})) if (!drop.has(k)) keep[k] = v;
+  return Object.keys(keep).length ? keep : "done";
+}
+
+// ---------- the "+ Start an assistant" dialog ----------
+function openAsstDialog() {
+  loadAsstCatalog().then(() => {
+    const caps = (state.asstCatalog.capabilities || [])
+      .filter((c) => c.safe_default).map((c) => c.id);
+    state.asstDialog = { template: null, role: "", name: "", description: "",
+                         interval: 60, caps, soul: "", start: true, busy: false, error: "" };
+    repaintRight();
+  });
+}
+
+function applyTemplate(key) {
+  const t = ((state.asstCatalog || {}).templates || []).find((x) => x.key === key);
+  const d = state.asstDialog;
+  if (!d) return;
+  if (!t) { d.template = null; repaintRight(); return; }
+  d.template = key;
+  d.role = t.role; d.name = t.name; d.description = t.description || "";
+  d.interval = t.interval_minutes || 60;
+  d.caps = (t.capabilities || []).slice();
+  d.soul = t.soul_md || "";
+  repaintRight();
+}
+
+function assistantDialog() {
+  const d = state.asstDialog;
+  const templates = (state.asstCatalog || {}).templates || [];
+  const allCaps = (state.asstCatalog || {}).capabilities || [];
+
+  const picker = el("div", { class: "tpl-grid" },
+    templates.map((t) => el("button", {
+      class: "tpl" + (d.template === t.key ? " active" : ""),
+      onclick: () => applyTemplate(t.key) },
+      el("div", { class: "tpl-role" }, t.role),
+      el("div", { class: "tpl-opt" }, "optimises for " + (t.optimises || "")),
+      el("div", { class: "tpl-desc" }, t.description || ""))),
+    el("button", { class: "tpl blank" + (d.template === null ? " active" : ""),
+      onclick: () => applyTemplate(null) },
+      el("div", { class: "tpl-role" }, "Something else"),
+      el("div", { class: "tpl-opt" }, "your own role"),
+      el("div", { class: "tpl-desc" },
+        "Security, SEO, compliance, on-call, expense… type any role you like. Roles are not "
+        + "a fixed list.")));
+
+  const roleInp = field("Role", el("input", { type: "text", value: d.role,
+    placeholder: "e.g. Security assistant", oninput: (e) => { d.role = e.target.value; } }));
+  const nameInp = field("Name", el("input", { type: "text", value: d.name,
+    placeholder: "What you'll call it", oninput: (e) => { d.name = e.target.value; } }));
+  const descInp = field("Description", el("input", { type: "text", value: d.description,
+    placeholder: "One line: what it is for",
+    oninput: (e) => { d.description = e.target.value; } }));
+  const intInp = field("Heartbeat (minutes)", el("input", { type: "text", value: String(d.interval),
+    inputmode: "numeric", oninput: (e) => { d.interval = Number(e.target.value) || 60; } }));
+
+  const capBox = el("div", { class: "asst-caps wrap" },
+    allCaps.map((c) => {
+      const on = d.caps.includes(c.id);
+      const risky = c.safe_default === false;
+      return el("button", {
+        class: "cap-chip toggle" + (on ? " on" : "") + (risky ? " risky" : ""),
+        title: c.detail, onclick: () => {
+          d.caps = on ? d.caps.filter((x) => x !== c.id) : d.caps.concat([c.id]);
+          repaintRight();
+        } }, (on ? "✓ " : "＋ ") + c.label + (risky ? " ⚠" : ""));
+    }));
+
+  const soulTa = el("textarea", { class: "soul-editor sm", spellcheck: "false",
+    placeholder: "Leave blank and a SOUL is written for the role you typed." });
+  soulTa.value = d.soul || "";
+  soulTa.addEventListener("input", () => { d.soul = soulTa.value; });
+
+  const startBox = el("label", { class: "asst-check" },
+    checkbox(d.start, (v) => { d.start = v; }),
+    el("span", {}, "Start beating immediately"));
+
+  return el("div", { class: "asst-modal", onclick: (e) => {
+      if (e.target.classList.contains("asst-modal")) closeAsstDialog();
+    } },
+    el("div", { class: "asst-modal-box" },
+      el("div", { class: "asst-modal-head" },
+        el("span", { class: "cb-title" }, "Start an assistant"),
+        el("div", { class: "spacer" }),
+        el("button", { class: "btn ghost sm", onclick: () => closeAsstDialog() }, "✕")),
+      el("p", { class: "cb-note" },
+        "Pick a starting point, then edit anything. These are PRE-FILLS — the role is free "
+        + "text and nothing here limits what an assistant can be."),
+      picker,
+      el("div", { class: "row2" }, roleInp, nameInp),
+      descInp,
+      el("div", { class: "row2" }, intInp,
+        el("div", { class: "field" }, el("label", {}, "Start"), startBox)),
+      el("div", { class: "field" },
+        el("label", {}, "Capabilities — this, not the role name, is what is enforced"),
+        capBox,
+        el("div", { class: "asst-dim small" },
+          "⚠ marks a capability that is OFF by default in v1: an agent that edits code or "
+          + "deploys unattended needs the quota + guard work first.")),
+      el("div", { class: "field" }, el("label", {}, "SOUL.md"), soulTa),
+      d.error ? el("div", { class: "asst-err" }, d.error) : null,
+      el("div", { class: "asst-modal-foot" },
+        el("button", { class: "btn sm", onclick: () => closeAsstDialog() }, "Cancel"),
+        el("button", { class: "btn primary sm", disabled: d.busy,
+          onclick: () => submitAsstDialog() }, d.busy ? "Starting…" : "Start assistant"))));
+}
+
+function field(label, input) {
+  return el("div", { class: "field" }, el("label", {}, label), input);
+}
+function checkbox(on, onChange) {
+  const b = el("button", { class: "asst-box" + (on ? " on" : ""), type: "button" },
+    on ? "✓" : "");
+  b.addEventListener("click", (e) => {
+    e.preventDefault();
+    on = !on; b.className = "asst-box" + (on ? " on" : ""); b.textContent = on ? "✓" : "";
+    onChange(on);
+  });
+  return b;
+}
+
+function closeAsstDialog() { state.asstDialog = null; repaintRight(); }
+
+async function submitAsstDialog() {
+  const d = state.asstDialog;
+  if (!d || !state.project) return;
+  const role = (d.role || "").trim();
+  if (!role) { d.error = "Give it a role — any words you like."; repaintRight(); return; }
+  d.busy = true; d.error = ""; repaintRight();
+  try {
+    await api.createAssistant(state.project.id, {
+      role, name: (d.name || "").trim() || role, description: (d.description || "").trim(),
+      soul_md: (d.soul || "").trim() || undefined,
+      capabilities: d.caps, interval_minutes: Number(d.interval) || 60, start: !!d.start,
+    });
+    state.asstDialog = null;
+    toast("Assistant started.", "ok");
+    await loadTab("assistants", { force: true });
+  } catch (e) {
+    d.busy = false;
+    d.error = (e && e.message) || "Could not start that assistant.";
+    repaintRight();
+  }
+}
+
+// ---------- actions ----------
+function selectAssistant(aid) {
+  state.asstSel = aid;
+  state.asstSoulDraft = null;
+  repaintRight();
+  loadAssistantDetail(aid, true);
+}
+
+async function loadAssistantDetail(aid, force) {
+  if (!state.project) return;
+  const id = state.project.id;
+  if (!force && state.asstDetail && state.asstDetail.id === aid) return;
+  const keepDraft = state.asstSoulDraft;
+  state.asstDetail = { id: aid, loading: !state.asstDetail || state.asstDetail.id !== aid };
+  if (state.tab === "assistants") repaintRight();
+  let next;
+  try { next = { id: aid, data: await api.assistant(id, aid) }; }
+  catch (e) {
+    next = { id: aid, error: (e && e.name === "NotFoundError")
+      ? "That assistant is gone." : ((e && e.message) || "Could not load this assistant.") };
+  }
+  if (!state.project || state.project.id !== id || state.asstSel !== aid) return;
+  state.asstDetail = next;
+  state.asstSoulDraft = keepDraft;
+  if (state.tab === "assistants") repaintRight();
+}
+
+async function patchAssistant(aid, body, opts = {}) {
+  if (!state.project) return;
+  state.asstBusy = true; repaintRight();
+  try {
+    await api.patchAssistant(state.project.id, aid, body);
+    if (opts.soul) { state.asstSoulDraft = null; toast("SOUL saved.", "ok"); }
+    else toast("Saved.", "ok");
+  } catch (e) { toast((e && e.message) || "Could not save that.", "err"); }
+  state.asstBusy = false;
+  if (state.asstSel === aid) await loadAssistantDetail(aid, true);
+  else await loadTab("assistants", { force: true });
+  repaintRight();
+}
+
+async function deleteAssistant(aid, label) {
+  if (!state.project) return;
+  if (!window.confirm("Delete " + (label || "this assistant") + " and its beat history?")) return;
+  state.asstBusy = true; repaintRight();
+  try {
+    await api.deleteAssistant(state.project.id, aid);
+    toast("Assistant deleted.", "ok");
+    state.asstSel = null; state.asstDetail = null;
+  } catch (e) { toast((e && e.message) || "Could not delete that.", "err"); }
+  state.asstBusy = false;
+  await loadTab("assistants", { force: true });
+  repaintRight();
+}
+
+async function assistantAct(aid, action) {
+  if (!state.project || state.asstBusy) return;
+  state.asstBusy = true; repaintRight();
+  try {
+    await api.assistantAction(state.project.id, aid, action);
+    if (action === "beat") {
+      toast("Beat started — it runs in a container and takes ~30-90s.", "ok");
+      startBeatPoll(aid);
+    } else {
+      toast(action === "start" ? "Heartbeat started." : "Heartbeat paused.", "ok");
+    }
+  } catch (e) {
+    toast((e && e.message) || "That did not work.", "err");
+  }
+  state.asstBusy = false;
+  if (state.asstSel === aid) await loadAssistantDetail(aid, true);
+  else await loadTab("assistants", { force: true });
+  repaintRight();
+}
+
+// A beat is a container start plus an LLM round, so it lands seconds AFTER the click.
+// Poll until it stops being `running` (bounded — never a forever timer).
+function stopBeatPoll() {
+  if (state.asstPoll) { clearInterval(state.asstPoll); state.asstPoll = null; }
+}
+function startBeatPoll(aid) {
+  stopBeatPoll();
+  let ticks = 0;
+  state.asstPoll = setInterval(async () => {
+    ticks++;
+    if (ticks > 60 || state.tab !== "assistants") { stopBeatPoll(); return; }
+    try {
+      if (state.asstSel === aid) await loadAssistantDetail(aid, true);
+      else await loadTab("assistants", { force: true });
+      const beats = state.asstSel === aid
+        ? ((state.asstDetail && state.asstDetail.data && state.asstDetail.data.beats) || [])
+        : [];
+      if (state.asstSel === aid && beats.length && beats[0].status !== "running") {
+        stopBeatPoll();
+      }
+    } catch { /* a transient poll failure must never break the tab */ }
+  }, 4000);
 }
 
 // ----- Danger Zone: lifecycle control; destroy demands the app id typed out -----

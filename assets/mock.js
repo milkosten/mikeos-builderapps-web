@@ -383,4 +383,42 @@ export const mockApi = {
                        idx, name: name.toLowerCase().replace(/[^a-z0-9]+/g, "_"),
                        status: "done", log: "ok", ts: new Date().toISOString() })) };
   },
+
+  // --- per-project AI assistants (phase 29) ---
+  // Enough for the tab to render in ?mock=1; a NotFoundError would make it read as
+  // "not shipped yet", which would be a lie once the backend is live.
+  async assistantsCatalog() {
+    await wait(120);
+    return { roles_are_open_ended: true,
+      limits: { min_interval_minutes: 5, max_interval_minutes: 10080, max_per_project: 12 },
+      capabilities: [
+        { id: "read_repo", label: "Read the repo", detail: "Clone and read the checkout.", safe_default: true },
+        { id: "comment", label: "Comment", detail: "Post findings into the project thread.", safe_default: true },
+        { id: "read_costs", label: "Read usage & cost", detail: "Read token/cost accounting.", safe_default: true },
+        { id: "run_qa", label: "Run QA", detail: "Exercise the live app in a browser.", safe_default: true },
+        { id: "edit_code", label: "Edit code", detail: "Write files in its own checkout.", safe_default: false },
+        { id: "commit_push", label: "Commit & push", detail: "Push to the project repo.", safe_default: false },
+        { id: "request_deploy", label: "Request a deploy", detail: "Ask the control plane to deploy.", safe_default: false },
+      ],
+      templates: [
+        { key: "product_owner", role: "Product Owner", name: "Product Owner", optimises: "the product is worth using",
+          description: "Reads the goals, judges the gap, proposes the next thing.",
+          capabilities: ["read_repo", "comment", "read_costs"], interval_minutes: 120, soul_md: "# Who I am\nProduct owner." },
+        { key: "developer", role: "Developer", name: "Developer", optimises: "it works and stays clean",
+          description: "Reads the code, spots rot, proposes the fix.",
+          capabilities: ["read_repo", "comment"], interval_minutes: 60, soul_md: "# Who I am\nEngineer." },
+      ] };
+  },
+  async assistants() { await wait(120); return { assistants: [] }; },
+  async createAssistant(id, body) {
+    await wait(200);
+    return { id: 1, project_id: id, role: body.role || "Assistant", name: body.name || "Assistant",
+             description: body.description || "", capabilities: body.capabilities || [],
+             interval_minutes: body.interval_minutes || 60, status: body.start ? "active" : "paused" };
+  },
+  async assistant(id, aid) { await wait(120); return { id: aid, project_id: id, role: "Assistant", name: "Assistant", capabilities: [], interval_minutes: 60, status: "paused", soul_md: "", beats: [] }; },
+  async patchAssistant(id, aid, body) { await wait(150); return { id: aid, project_id: id, ...body }; },
+  async deleteAssistant() { await wait(150); return { ok: true }; },
+  async assistantAction() { await wait(150); return { ok: true, status: "running" }; },
+  async assistantBeats() { await wait(120); return { beats: [] }; },
 };
