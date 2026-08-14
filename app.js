@@ -1286,11 +1286,6 @@ function autoGrow(ta) {
   ta.style.height = Math.min(ta.scrollHeight, 160) + "px";
 }
 
-function scrollThread() {
-  const t = document.getElementById("chat-thread");
-  if (t) t.scrollTop = t.scrollHeight;
-}
-
 // ============ THE SCROLL POLICY FOR THE CHAT THREAD ============================
 // Exactly three cases. Every repaint of the left pane DECLARES which one it is; none of
 // them is inferred.
