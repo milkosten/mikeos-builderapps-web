@@ -1,0 +1,19 @@
+# builderapps-web — a small Caddy that serves the builderapps SPA on 242.
+# The shared Caddy (deploy-caddy-1) reverse-proxies builderapps.osmike.com to this
+# container on the deploy_default network. Generated project apps live on the
+# wildcard *.builderapps.osmike.com and are routed by the shared Caddy, not here.
+services:
+  builderapps-web:
+    image: caddy:2
+    container_name: builderapps-web
+    restart: unless-stopped
+    volumes:
+      - /opt/mikeos-builderapps-web/web-Caddyfile:/etc/caddy/Caddyfile:ro
+      - /opt/mikeos-builderapps-web:/srv/spa:ro
+    networks: [deploy_default]
+    mem_limit: 128m
+    cpus: 0.5
+
+networks:
+  deploy_default:
+    external: true

@@ -1,0 +1,12 @@
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MikeOS BuilderApps</title>
+<meta name="description" content="Describe an app. Watch the AI pipeline build it live. See it deployed." />
+<link rel="stylesheet" href="/assets/styles.css" />
+
+<!-- App root. app.js renders everything into #root. -->
+<div id="root" aria-live="polite"></div>
+
+<!-- config first (deploy-adjustable), then the app (ES module). -->
+<script src="/config.js"></script>
+<script type="module" src="/app.js"></script>

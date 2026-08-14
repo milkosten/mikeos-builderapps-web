@@ -1,0 +1,26 @@
+# Internal Caddyfile for the `builderapps-web` container. The SHARED Caddy
+# (deploy-caddy-1) reverse-proxies builderapps.osmike.com -> this container:80.
+# Generated project apps are NOT served here — they live on the wildcard
+# *.builderapps.osmike.com and are routed by the shared Caddy directly.
+{
+	admin off
+	auto_https off
+}
+
+:80 {
+	encode zstd gzip
+
+	# SPA client-side routes: the app root and the OAuth callback both render the shell.
+	@spa path / /auth/callback
+	handle @spa {
+		root * /srv/spa
+		rewrite * /index.html
+		file_server
+	}
+
+	# Everything else (the SPA's own assets: /app.js, /config.js, /assets/*) from disk.
+	handle {
+		root * /srv/spa
+		file_server
+	}
+}
