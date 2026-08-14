@@ -18,6 +18,11 @@ const state = {
   // live pipeline buffer during a stream: ordered step objects
   live: null,         // { steps:[{idx,name,status}], url, statusText }
   previewNonce: 0,    // bump to force the preview iframe to reload as deploys land
+  // Whether the Site tab's iframe can render this app at all — { key, loading, data }.
+  // Computed server-side (see api.projectEmbeddable) and cached per project+deploy, because
+  // the alternative is Chrome's grey "refused to connect" and a user who thinks their
+  // working app is dead. Keyed so a repaint never means another probe.
+  embed: null,
   booting: true,
   hydrating: false,   // loading /builder/<id> from the server
   entryDraft: "",     // the entry-screen textarea text (preserved across renders)
@@ -2612,10 +2617,80 @@ function urlPill(proj) {
     isMock() ? el("span", {}, url) : el("a", { href: url, target: "_blank", rel: "noopener" }, url));
 }
 
+// ---------- can this app be shown in the preview frame at all? ----------
+// An app is entitled to defend itself against clickjacking, and a good one does. But the
+// only header that can say "deny everyone EXCEPT the builder" is CSP `frame-ancestors`;
+// `X-Frame-Options: DENY` cannot, and a generated app that shipped both disappeared from
+// its owner's Site tab behind Chrome's grey "refused to connect" while serving 200s with a
+// green /health. The browser gives the embedding page NO signal for this — the load is
+// refused before any script in the frame runs, and the headers are cross-origin — so the
+// answer is computed on the server and rendered here as a sentence a human can act on.
+//
+// Probed once per project per deploy (the key), never per repaint: the Site tab is
+// re-rendered on every tab switch and every status change.
+function embedKey(proj) { return (proj ? proj.id : "") + "@" + state.previewNonce; }
+
+// Set by "Re-check": the server caches its probe for a minute, so a user pressing the
+// button after fixing their app has to be able to say "ask again, for real".
+let _embedForce = false;
+
+function ensureEmbedCheck(proj) {
+  if (!proj || isMock() || !api.projectEmbeddable) return null;
+  const key = embedKey(proj);
+  if (state.embed && state.embed.key === key) return state.embed.data;
+  const force = _embedForce; _embedForce = false;
+  state.embed = { key, loading: true, data: null };
+  // Deferred: never start a fetch (and the repaint that follows it) inside a render pass.
+  setTimeout(async () => {
+    let data = null;
+    try { data = await api.projectEmbeddable(proj.id, force); } catch { data = null; }
+    if (!state.embed || state.embed.key !== key) return;      // project/deploy moved on
+    state.embed = { key, loading: false, data };
+    // Only repaint when the answer CHANGES what is on screen. The optimistic first paint
+    // is the iframe, so a "yes, embeddable" needs no repaint at all — repainting anyway
+    // would reload the frame the user is already looking at.
+    if (data && data.embeddable === false && state.tab === "site") repaintRight();
+  }, 0);
+  return null;
+}
+
+// The honest alternative to a dead grey frame: say what is blocking it, in the app's own
+// terms, and keep the one action that still works — opening it in a tab.
+function embedBlockedPanel(proj, info) {
+  const url = proj.url || appUrl(proj);
+  const reason = (info && info.reason) || "This app refuses to be displayed in a frame.";
+  return el("div", { class: "placeholder embed-blocked" },
+    el("div", { class: "inner" },
+      el("div", { class: "big" }, "⛨"),
+      el("h2", {}, "This app blocks embedding"),
+      el("p", {}, reason),
+      info && info.frame_ancestors
+        ? el("pre", { class: "embed-hdr" }, "content-security-policy: frame-ancestors " + info.frame_ancestors)
+        : null,
+      info && info.x_frame_options
+        ? el("pre", { class: "embed-hdr" }, "x-frame-options: " + info.x_frame_options)
+        : null,
+      el("p", { class: "embed-note" },
+        "The app itself is fine — this only stops the preview pane. Open it in a new tab, "
+        + "or ask an assistant to allow the builder in its Content-Security-Policy."),
+      el("div", { class: "embed-actions" },
+        el("a", { class: "btn primary sm", href: url, target: "_blank", rel: "noopener" },
+          "Open " + proj.id + " ↗"),
+        el("button", { class: "btn ghost sm", onclick: () => {
+          _embedForce = true; state.embed = null; state.previewNonce++; repaintRight();
+        } }, "Re-check"))));
+}
+
 // Live preview of the deployed app. Reloads (via a nonce) as deploys land. In mock mode
 // there is no real host, so show a friendly placeholder frame instead of a 502.
 function previewIframe(proj) {
   const url = proj.url || appUrl(proj);
+  // Optimistic by default: while the check is in flight (and if it cannot be made at all)
+  // we show the frame. Claiming an app blocks embedding when we merely failed to ask would
+  // be its own kind of lie.
+  const info = ensureEmbedCheck(proj);
+  if (info && info.embeddable === false) return embedBlockedPanel(proj, info);
+
   const frame = el("iframe", { class: "preview-frame", title: "Live app preview",
     sandbox: "allow-scripts allow-forms allow-popups allow-same-origin" });
   if (isMock()) {
@@ -2916,6 +2991,7 @@ function resetBuilder() {
   state.asstRoster = null;
   state.composerDraft = ""; state.composerError = "";
   state.previewNonce = 0;
+  state.embed = null;          // a verdict about the LAST app's headers, not this one's
   state.tab = "site";
   state.openTabs = [];
   state.tabs = {};

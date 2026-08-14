@@ -148,6 +148,11 @@ const live = {
   projectMetrics:     (id)     => sub(id, "metrics"),
   projectCache:       (id)     => sub(id, "cache"),
   projectDomain:      (id)     => sub(id, "domain"),
+  // Can the builder put this app in its preview iframe? Answered SERVER-SIDE: framing is
+  // refused by the browser before any script inside the frame runs, and cross-origin
+  // response headers are unreadable from JS — so the SPA cannot tell "this app blocks
+  // embedding" from "this app is down". Both look like the browser's "refused to connect".
+  projectEmbeddable:  (id, refresh) => sub(id, "embeddable" + (refresh ? "?refresh=1" : "")),
   projectEnv:         (id)     => sub(id, "env"),
   lifecycle:     (id, action)  =>
     req("POST", `/api/projects/${encodeURIComponent(id)}/lifecycle`, { action }),
