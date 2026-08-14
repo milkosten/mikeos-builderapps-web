@@ -1493,8 +1493,18 @@ button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 
 }
 
 /* ----- the room's shell ----- */
-.discuss-split { grid-template-columns: 1fr minmax(280px, 340px); }
-.left.discuss { border-right: 1px solid var(--border); background: var(--bg); }
+/* `grid-template-rows: 1fr` and the .left resets below are NOT redundant. The builder has a
+   long-standing `@media (max-width: 860px)` rule that turns `.split` into ONE column of two
+   rows and caps `.left` at 46vh — right for the builder (chat above a preview) and wrong
+   here, where it capped the conversation at 276px of an 600px window and left the composer
+   floating in the middle of the screen with dead space under it. A modifier class that only
+   overrides `grid-template-columns` inherits the rest of the other component's responsive
+   behaviour; this is the second half of that override. */
+.discuss-split { grid-template-columns: 1fr minmax(280px, 340px); grid-template-rows: 1fr; }
+.left.discuss {
+  border-right: 1px solid var(--border); border-bottom: 0; background: var(--bg);
+  max-height: none; height: 100%; min-height: 0;
+}
 /* The centred column. Applied to the SCROLLER itself so the scrollbar sits at the panel edge
    where a reader expects it, not inside the text column. */
 .left.discuss .chat-thread {
@@ -1699,6 +1709,7 @@ button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 
    and hiding it at 900px would have turned every 13" laptop into the version without it. */
 @media (max-width: 680px) {
   .discuss-split, .discuss-split:has(.canvas-collapsed) { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+  .left.discuss { max-height: none; border-bottom: 1px solid var(--border); }
   .right.canvas { max-height: 40vh; border-left: 0; border-top: 1px solid var(--border); }
   .right.canvas-collapsed, .right.canvas-empty { display: none; }
   .discuss-title-text { max-width: 140px; }
