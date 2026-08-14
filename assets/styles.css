@@ -1396,3 +1396,81 @@ button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 
 .ws-ev-to { color: var(--text); }
 .ws-ev-note { flex: 1 1 100%; color: var(--text-mute); font-size: 11.5px;
   padding-left: 74px; line-height: 1.45; }
+
+/* ============================================================================
+   Phase 33 — messages BETWEEN assistants, in the left pane.
+
+   Three voices now share this thread and a reader must be able to tell them apart at a
+   glance without reading a word:
+
+     .msg.user                 the human, right-aligned
+     .bubble.assistant-activity  one assistant WORKING — avatar, hue, activity lines
+     .bubble.dm                two assistants TALKING TO EACH OTHER — a conversation the
+                               human is overhearing rather than part of
+
+   Hence: no avatar (an avatar reads as another beat), a lighter inset card, and the sender's
+   own hue on the rail so "who is speaking" is the same colour it is everywhere else.
+   ============================================================================ */
+.msg.dm-msg { padding-left: 34px; }               /* aligns with the avatar column above it */
+.msg.dm-msg .bubble { max-width: 352px; }
+.bubble.dm {
+  background: hsla(var(--aa-hue), 40%, 30%, .16);
+  border: 1px solid hsla(var(--aa-hue), 45%, 55%, .30);
+  border-left: 3px solid hsl(var(--aa-hue), 60%, 55%);
+  border-radius: 10px;
+  padding: 8px 11px 9px;
+}
+.dm-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 5px; }
+.dm-who   { font-size: 12.5px; font-weight: 700; color: hsl(var(--aa-hue), 65%, 78%); }
+.dm-arrow { font-size: 12.5px; color: var(--text-mute); }
+.dm-dot   { color: var(--text-mute); }
+.dm-time  { font-size: 11.5px; color: var(--text-mute); font-variant-numeric: tabular-nums; }
+.dm-ref {
+  font: inherit; font-size: 11px; font-weight: 700; cursor: pointer;
+  background: hsla(var(--aa-hue), 50%, 50%, .20); color: hsl(var(--aa-hue), 60%, 82%);
+  border: 1px solid hsla(var(--aa-hue), 50%, 55%, .40);
+  border-radius: 999px; padding: 1px 7px; margin-left: 2px; line-height: 1.6;
+}
+.dm-ref:hover { background: hsla(var(--aa-hue), 55%, 55%, .34); }
+.dm-body { font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* A BOUND THAT FIRED IS SHOWN. The message is stored and readable; what did not happen is
+   the wake — and hiding that would be indistinguishable from a message that was delivered
+   and ignored, which is the one reading that would make the sender look broken. */
+.bubble.dm.blocked { border-style: dashed; opacity: .92; }
+.dm-stop {
+  margin-top: 7px; padding: 6px 8px; border-radius: 7px;
+  background: rgba(240, 170, 60, .10); border: 1px solid rgba(240, 170, 60, .34);
+  color: #f0c489; font-size: 11.5px; line-height: 1.5;
+}
+
+/* "3 new since you were last here" — assistants work with nobody watching, so coming back
+   has to say what moved instead of looking identical to a project that slept. */
+.unread-divider {
+  display: flex; align-items: center; gap: 10px; margin: 4px 0 2px;
+  color: var(--accent); font-size: 11.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .05em;
+}
+.unread-divider::before, .unread-divider::after {
+  content: ""; flex: 1; height: 1px; background: var(--accent); opacity: .38;
+}
+
+/* THE HARD STOP. Not a cost figure and not a warning: work has HALTED. */
+.bubble.budget-stop {
+  background: rgba(220, 90, 70, .12); border: 1px solid rgba(220, 90, 70, .42);
+  border-radius: 10px; padding: 10px 12px;
+}
+.bs-head { font-weight: 700; font-size: 13px; color: #f2a08e; margin-bottom: 4px; }
+.bs-body { font-size: 12.5px; line-height: 1.55; color: var(--text-2); margin-bottom: 8px; }
+
+/* Apps-list rollup: what moved, and what has stopped. */
+.badge-new {
+  background: var(--accent); color: #08131f; border-radius: 999px;
+  font-size: 11px; font-weight: 800; padding: 1px 8px; line-height: 1.7;
+  min-width: 20px; text-align: center;
+}
+.badge-stop {
+  background: rgba(220, 90, 70, .16); color: #f2a08e;
+  border: 1px solid rgba(220, 90, 70, .45); border-radius: 999px;
+  font-size: 10.5px; font-weight: 700; padding: 1px 8px; line-height: 1.7; white-space: nowrap;
+}

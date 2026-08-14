@@ -72,6 +72,23 @@ const state = {
   // so anything of the server's parked there gets clobbered on the next save.
   assistantActivity: null,   // { beating, beats:[{beat_id,name,role,status,activity:[…]}] }
 
+  // ----- messaging between assistants (phase 33) -----
+  // What the assistants have said TO EACH OTHER. Server-owned like the activity feed, and
+  // kept well away from state.messages for the same reason: that array is PUT back and the
+  // server replaces the thread with it, so anything of the server's parked there gets
+  // clobbered on the next save. Rendered interleaved with the beats, oldest first.
+  dms: [],                   // [{id,from_name,to_name,body_md,refs_item_id,blocked,depth,created_at}]
+  maxChainDepth: 0,          // how deep one conversation may go before it is stopped
+  // Today's spend against the daily cap. `stopped` means assistant work has HALTED — the one
+  // state here that has to be shouted rather than mentioned.
+  budget: null,              // { spent_today_usd, daily_limit_usd, remaining_usd, stopped }
+  // Is the live socket up? Cosmetic only: the poll is the fallback, and DELIVERY between
+  // assistants never involved this browser at all.
+  wsLive: false,
+  // "N new since you were last here", carried in from the Apps list rollup so the builder
+  // can say it once on arrival, before it marks everything seen.
+  unreadOnArrival: 0,
+
   // Who can be addressed with "@" in the composer. Fetched from the SAME endpoint the
   // Assistants tab uses (and re-seeded from its payload) so the picker and the tab can
   // never disagree about who exists. Held here rather than read out of
@@ -589,11 +606,41 @@ function appsView() {
             el("a", { href: url, target: "_blank", rel: "noopener",
               onclick: (e) => e.stopPropagation() }, url))),
         el("div", { class: "app-card-side" },
+          // WHAT HAPPENED WHILE YOU WERE AWAY. Assistants beat on their own schedule and now
+          // wake each other with messages, none of which needs a browser open — so a project
+          // that worked all night looked exactly like one that slept. These two badges are
+          // the whole point of the rollup: what MOVED, and whether it has HALTED.
+          budgetBadge(p.budget),
+          unreadBadge(p.unread),
           statusPill(p.status),
           el("span", { class: "app-card-when" }, fmtDate(p.updated_at || p.created_at)))));
     }
   }
   return el("div", {}, head, list);
+}
+
+// "3 new" — beats finished and messages sent since this user last opened the project.
+function unreadBadge(u) {
+  const n = (u && Number(u.total)) || 0;
+  if (!n) return null;
+  const dms = (u && Number(u.dms)) || 0;
+  return el("span", {
+    class: "badge-new",
+    title: dms ? `${n} new — including ${dms} message${dms === 1 ? "" : "s"} between assistants`
+               : `${n} new since you last opened this app`,
+  }, n > 99 ? "99+" : String(n));
+}
+
+// The stop, not the spend. A project under its cap shows nothing here — a running cost
+// counter on every card is noise, and noise is what a real alert has to compete with.
+function budgetBadge(b) {
+  if (!b || !b.stopped) return null;
+  return el("span", {
+    class: "badge-stop",
+    title: `Assistant work is PAUSED — $${Number(b.spent_today_usd || 0).toFixed(2)} of the ` +
+           `$${Number(b.daily_limit_usd || 0).toFixed(2)} daily budget is spent. It resumes ` +
+           "at midnight UTC.",
+  }, "paused · budget");
 }
 
 // ----- Settings: theme/preferences persisted in localStorage -----
@@ -766,15 +813,22 @@ function leftPanel() {
     thread.appendChild(el("div", { class: "msg assistant" }, el("div", { class: "avatar" }, "B"),
       el("div", { class: "bubble" }, el("div", { class: "hydrating" },
         el("span", { class: "spin sm" }), el("span", {}, "Loading this app's history…")))));
-  } else if (!state.messages.length && !state.runHistory && !activityBeats().length) {
+  } else if (!state.messages.length && !state.runHistory && !assistantTimeline().length) {
     thread.appendChild(chatIntro());
   } else {
     for (const m of state.messages) thread.appendChild(chatBubble(m));
     // Executed steps replayed from the server go last, below the conversation.
     if (state.runHistory) thread.appendChild(runHistoryBubble(state.runHistory));
-    // …and below THAT, what the assistants have been doing since (oldest beat first).
-    for (const b of activityBeats()) thread.appendChild(assistantBeatBubble(b));
+    // …and below THAT, what the assistants have been doing since — their beats AND the
+    // messages they have sent each other, INTERLEAVED in time. Two separate blocks would
+    // hide the only thing that makes a hand-off readable: that the Developer's beat happened
+    // BECAUSE of the Tester's message, immediately after it.
+    if (state.unreadOnArrival > 0) thread.appendChild(unreadDivider(state.unreadOnArrival));
+    for (const it of assistantTimeline()) {
+      thread.appendChild(it.dm ? dmBubble(it.dm) : assistantBeatBubble(it.beat));
+    }
   }
+  if (state.budget && state.budget.stopped) thread.appendChild(budgetStopBubble(state.budget));
   return el("div", { class: "left chat" }, thread, composer());
 }
 
@@ -882,11 +936,117 @@ function activityBeats() {
   return (f && Array.isArray(f.beats)) ? f.beats : [];
 }
 
+// Beats and assistant-to-assistant messages as ONE ordered timeline, oldest first.
+//
+// The interleaving is the point. A DM and the beat it caused are a single event to a reader
+// — "Tester → Developer: I filed #21, can you fix it?" and then the Developer's beat, right
+// underneath, doing exactly that. Rendered as two separate blocks, the causation is invisible
+// and the pane reads as two unrelated things that happened to occur.
+//
+// The feed only carries the last N beats, so a DM older than the oldest beat still shown is
+// dropped rather than dumped at the top out of context; the full history is the Assistants
+// tab and the API.
+function assistantTimeline() {
+  const beats = activityBeats();
+  const rows = beats.map((b) => ({ ts: b.ts, beat: b }));
+  const floor = beats.length ? new Date(beats[0].ts || 0).getTime() : 0;
+  for (const d of (state.dms || [])) {
+    if (floor && new Date(d.created_at || 0).getTime() < floor) continue;
+    rows.push({ ts: d.created_at, dm: d });
+  }
+  return rows.sort((a, b) => new Date(a.ts || 0) - new Date(b.ts || 0));
+}
+
 // Two assistants must not read as one voice, so each gets a stable hue derived from its
 // id (avatar + bubble edge). Deterministic, so a repaint never reshuffles the colours.
 function assistantHue(id) {
   const n = Number(id);
   return (((Number.isFinite(n) ? n : 0) * 67) + 200) % 360;
+}
+
+// `2026-08-14T19:01:22Z` -> `19:01`, in the reader's own timezone.
+function fmtClock(s) {
+  const d = new Date(s);
+  if (isNaN(d)) return "";
+  return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+}
+
+// ONE message from one assistant to another:
+//
+//     Tester → Developer · 21:47
+//     Bug #21 is a privacy breach on the live home page…
+//
+// Visually distinct from BOTH of its neighbours on purpose. A user message is the human
+// talking; a beat bubble is one assistant working; this is two assistants talking to each
+// other — a conversation the human is overhearing rather than part of. Hence the envelope
+// rail, the sender's own hue, and no avatar (an avatar would make it read as another beat).
+function dmBubble(m) {
+  const hue = assistantHue(m.from_assistant);
+  const blocked = String(m.blocked || "");
+  const bubble = el("div", { class: "bubble dm" + (blocked ? " blocked" : ""),
+                             style: "--aa-hue:" + hue });
+
+  const head = el("div", { class: "dm-head" },
+    el("span", { class: "dm-who" }, String(m.from_name || "system")),
+    el("span", { class: "dm-arrow" }, "→"),
+    el("span", { class: "dm-who" }, String(m.to_name || "")),
+    el("span", { class: "dm-dot" }, "·"),
+    el("span", { class: "dm-time" }, fmtClock(m.created_at)));
+  // The referenced item is what makes a hand-off a hand-off rather than a summary, so it is
+  // shown as a chip that OPENS the item — the reader gets the same one-click path to the
+  // whole report that the recipient assistant was handed inline.
+  if (m.refs_item_id) {
+    head.appendChild(el("button", {
+      class: "dm-ref", type: "button", title: "Open this workspace item",
+      onclick: () => { selectTab("workspace"); openWsItem(Number(m.refs_item_id)); },
+    }, "#" + m.refs_item_id));
+  }
+  bubble.appendChild(head);
+  bubble.appendChild(expandable(String(m.body_md || ""), "dm-body", 1200));
+
+  // A BOUND THAT FIRED IS SHOWN, not swallowed. The message is stored and readable; what did
+  // not happen is the wake. Hiding that would look exactly like a message that was delivered
+  // and ignored — the sender waiting for a reply, and no way to tell why none came.
+  if (blocked === "chain_depth") {
+    bubble.appendChild(el("div", { class: "dm-stop" },
+      `Conversation stopped here — it reached the maximum chain depth` +
+      (state.maxChainDepth ? ` of ${state.maxChainDepth}` : "") +
+      `. This message was saved and is readable, but nobody was woken for it. ` +
+      `Two assistants replying to each other indefinitely is real money and no product, ` +
+      `so work that still needs doing goes on the Workspace board instead.`));
+  } else if (blocked === "budget") {
+    bubble.appendChild(el("div", { class: "dm-stop" },
+      "Not delivered — this app reached its daily assistant budget, so no beat was started. " +
+      "The message is held, not lost; it can be read on the recipient's next ordinary beat."));
+  } else if (blocked) {
+    bubble.appendChild(el("div", { class: "dm-stop" }, "Not delivered (" + blocked + ")."));
+  }
+  return el("div", { class: "msg assistant dm-msg" }, bubble);
+}
+
+// "3 new since you were last here". Assistants work with nobody watching — that is the whole
+// design — so returning to a project has to say what moved rather than looking identical to
+// a project that slept.
+function unreadDivider(n) {
+  return el("div", { class: "unread-divider" },
+    el("span", {}, n === 1 ? "1 new since you were last here"
+                           : `${n} new since you were last here`));
+}
+
+// THE HARD STOP, said plainly. Not a warning and not a cost figure: work has HALTED.
+function budgetStopBubble(b) {
+  const spent = Number(b.spent_today_usd || 0).toFixed(2);
+  const limit = Number(b.daily_limit_usd || 0).toFixed(2);
+  return el("div", { class: "msg assistant" },
+    el("div", { class: "bubble budget-stop" },
+      el("div", { class: "bs-head" }, "Assistant work is paused for today"),
+      el("div", { class: "bs-body" },
+        `This app has spent $${spent} of its $${limit} daily budget, so no further ` +
+        "assistant beats will start until midnight UTC. Nothing is broken and nothing is " +
+        "lost — scheduled beats, direct asks and messages between assistants are all held, " +
+        "not dropped."),
+      el("button", { class: "btn sm ghost", type: "button",
+                     onclick: () => openExtraTab("usage") }, "See where it went")));
 }
 
 function beatMark(status) {
@@ -1499,6 +1659,14 @@ function leftSignature() {
       // stale; including them would repaint the pane on each keystroke and take the
       // caret with it — the exact flicker this gate exists to stop.
       n: (state.asstRoster || []).length,
+      // The DMs between assistants and the budget stop are RENDERED in this pane, so they
+      // have to be in the signature. Leaving them out is not a cosmetic miss: the gate would
+      // suppress the paint for a message that arrived while a beat's activity happened not to
+      // change, and the headline feature of this phase — a DM appearing live — would work
+      // only when something else moved at the same time.
+      d: (state.dms || []).map((x) => [x.id, x.blocked, x.read_at]).join("|"),
+      b: state.budget ? [state.budget.stopped, state.budget.spent_today_usd] : null,
+      u: state.unreadOnArrival,
     });
   } catch { return String(Math.random()); }   // never suppress a paint on an error
 }
@@ -3570,6 +3738,7 @@ function openProject(id) {
 function resetBuilder() {
   stopStepPolling();
   stopActivityPoll();
+  closeStream();
   clearInterval(logsTimer); logsTimer = null; state.logsAuto = false;
   state.project = null;
   state.live = null;
@@ -3578,6 +3747,7 @@ function resetBuilder() {
   // A different app's feed must never bleed into this one; and "the endpoint is missing"
   // was a verdict about the LAST project's fetch, so re-test it for the next one.
   state.assistantActivity = null;
+  state.dms = []; state.budget = null; state.unreadOnArrival = 0;
   activityMisses = 0; activityAbsent = false;
   // Same reasoning for who is mentionable, and for what was half-typed at them: both
   // belong to the app being left, not to the next one.
@@ -3656,6 +3826,27 @@ async function enterProject(id, { navigate = true } = {}) {
   // …and WHO they are, so "@" opens a populated picker on the first keystroke rather
   // than after a round trip the user has to wait through.
   refreshAssistantRoster();
+  // What moved while nobody was looking. Read BEFORE the high-water mark is advanced —
+  // the count and the "mark it seen" are two halves of one thing and the order is the
+  // whole trick: seen first would always report zero.
+  markSeen(id);
+}
+
+// "N new since you were last here", then move the mark.
+//
+// The count comes from the Apps list rollup the user just came through; asking again here
+// would be a second round trip for a number already in memory. If they deep-linked straight
+// to /builder/<id> there is no rollup to read and no divider is shown — which is right, since
+// they did not come past a list telling them something had happened.
+async function markSeen(id) {
+  const p = (state.projects || []).find((x) => x && x.id === id);
+  state.unreadOnArrival = (p && p.unread && Number(p.unread.total)) || 0;
+  if (state.unreadOnArrival) repaintLeft("open");
+  if (!api.projectSeen) return;
+  try {
+    await api.projectSeen(id);
+    if (p) p.unread = { dms: 0, beats: 0, total: 0 };
+  } catch { /* a marker that failed to move is not worth telling anyone about */ }
 }
 
 // Second source for the executed steps: GET /api/projects/{id}/steps. Runs after
@@ -3819,9 +4010,15 @@ async function activityTick() {
 }
 
 // Start (or restart) the feed for the current project, first fetch immediately.
+//
+// The poll fires ONCE regardless, even though the socket is about to take over: the first
+// paint must not wait on a WebSocket handshake, and if the socket never comes up (an old
+// control plane, a proxy that will not upgrade, a browser without it) this is the whole
+// mechanism. `openStream`'s onopen then stands the poll down.
 function startActivityPoll() {
   if (!state.project) return;
   scheduleActivityPoll(0);
+  openStream(state.project.id);
 }
 
 // Re-arm after a navigation that kept the same project — the tick chain deliberately
@@ -3843,16 +4040,140 @@ async function refreshAssistantActivity() {
     // The user may have switched apps while this was in the air — never paint a feed
     // from one project into another's thread.
     if (!state.project || state.project.id !== proj.id) return;
-    state.assistantActivity = (feed && Array.isArray(feed.beats)) ? feed : null;
-    mergeServerMessages(feed && feed.messages);
+    applyFeed(feed);
     activityMisses = 0;
-    repaintLeft("poll");// gated by leftSignature(): a no-op poll paints nothing
   } catch (e) {
     if (e instanceof NotFoundError || (e && e.name === "NotFoundError")) activityAbsent = true;
     else activityMisses++;      // transient: the next tick falls back to the idle cadence
   } finally {
     activityInFlight = false;
   }
+}
+
+// THE ONE PLACE a feed becomes screen state — whether it arrived by poll or was PUSHED down
+// the socket. Both transports carry the identical body (see messaging.live_feed), so there
+// is a single merge, a single repaint and a single scroll intent. Two paths would eventually
+// drift, and the one that drifts is always the one nobody reloads to check.
+//
+// Always "poll" as the repaint reason: nothing here was initiated by the user, so the scroll
+// policy must keep their place unless they were already at the bottom. A push is even MORE
+// obviously not user-initiated than a tick — it can land while they are reading history.
+function applyFeed(feed) {
+  if (!feed || !Array.isArray(feed.beats)) { state.assistantActivity = null; return; }
+  state.assistantActivity = feed;
+  state.dms = Array.isArray(feed.dms) ? feed.dms : [];
+  if (feed.budget) state.budget = feed.budget;
+  if (feed.max_chain_depth) state.maxChainDepth = feed.max_chain_depth;
+  mergeServerMessages(feed.messages);
+  repaintLeft("poll");   // gated by leftSignature(): a no-op feed paints nothing
+}
+
+// ---------------------------------------------------------------------------
+// THE LIVE CHANNEL (phase 33)
+// ---------------------------------------------------------------------------
+// Read the direction before changing anything here: this socket is a WINDOW, not a wire.
+// Assistants reach each other through a row in the database plus a wake, entirely
+// server-side, and that happens with this browser closed. All this does is show what has
+// already been written, which is why nothing is lost when it is down and why it may be
+// dropped at any moment without consequence.
+//
+// It replaces a poll that asked "anything new?" every 2.5 seconds and heard "no" almost
+// every time. The poll is kept as the FALLBACK and re-armed the instant the socket goes —
+// a pane frozen behind a half-open connection is far worse than one that polls.
+let wsSock = null;
+let wsProject = "";
+let wsRetry = 0;
+let wsPing = null;
+let wsLastFrame = 0;
+let wsWatchdog = null;
+
+// If a socket is up but silent for this long it is treated as dead. A TCP connection through
+// a proxy can be half-open for many minutes — writes vanish, no close event ever fires — and
+// that failure looks exactly like a project where nothing is happening. The server answers
+// every ping, so silence past this is not quiet, it is broken.
+const WS_SILENCE_MS = 70000;
+const WS_PING_MS = 25000;
+
+function wsUrl(projectId) {
+  const base = String(CFG.API_BASE || "").replace(/^http/, "ws");
+  // The token rides in the query string because the browser's WebSocket constructor takes a
+  // URL and a subprotocol list and nothing else — there is no way to set an Authorization
+  // header on it. Same Bearer, same server-side validation as every REST call.
+  return `${base}/api/projects/${encodeURIComponent(projectId)}/stream` +
+         `?token=${encodeURIComponent(auth.token() || "")}`;
+}
+
+function openStream(projectId) {
+  if (!projectId || isMock() || typeof WebSocket === "undefined") return;
+  if (wsSock && wsProject === projectId) return;      // already watching this one
+  closeStream();
+  wsProject = projectId;
+  let sock;
+  try {
+    sock = new WebSocket(wsUrl(projectId));
+  } catch {
+    return;                                            // stay on the poll; never throw at the UI
+  }
+  wsSock = sock;
+
+  sock.onopen = () => {
+    if (wsSock !== sock) return;
+    wsRetry = 0;
+    wsLastFrame = Date.now();
+    state.wsLive = true;
+    // The poll is stood DOWN, not merely slowed: "we are not polling" has to be literally
+    // true for this to have been worth building. It comes straight back on close.
+    stopActivityPoll();
+    wsPing = setInterval(() => { try { sock.send("ping"); } catch { /* close will fire */ } },
+                         WS_PING_MS);
+    wsWatchdog = setInterval(() => {
+      if (Date.now() - wsLastFrame > WS_SILENCE_MS) { try { sock.close(); } catch { /* */ } }
+    }, 10000);
+  };
+
+  sock.onmessage = (ev) => {
+    if (wsSock !== sock) return;
+    wsLastFrame = Date.now();
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (!msg || msg.type === "pong") return;
+    // Never paint one project's feed into another's thread — the same guard the poll has,
+    // and it matters more here because a frame can land during a navigation.
+    if (!state.project || state.project.id !== wsProject) return;
+    if (msg.type === "feed") applyFeed(msg);
+    else if (msg.type === "budget" && msg.budget) { state.budget = msg.budget; repaintLeft("poll"); }
+  };
+
+  const down = () => {
+    if (wsSock !== sock) return;
+    wsSock = null;
+    state.wsLive = false;
+    clearInterval(wsPing); wsPing = null;
+    clearInterval(wsWatchdog); wsWatchdog = null;
+    // FALL BACK IMMEDIATELY. Whatever went wrong, the pane must not sit still.
+    ensureActivityPoll();
+    // …and try to come back, with a backoff so a control-plane redeploy is not met by a
+    // reconnect storm from every open tab.
+    if (state.view === "builder" && state.project && state.project.id === wsProject) {
+      const wait = Math.min(30000, 1000 * Math.pow(2, wsRetry++));
+      setTimeout(() => {
+        if (state.view === "builder" && state.project && state.project.id === wsProject) {
+          openStream(wsProject);
+        }
+      }, wait);
+    }
+  };
+  sock.onclose = down;
+  sock.onerror = down;
+}
+
+function closeStream() {
+  const sock = wsSock;
+  wsSock = null;
+  state.wsLive = false;
+  clearInterval(wsPing); wsPing = null;
+  clearInterval(wsWatchdog); wsWatchdog = null;
+  if (sock) { try { sock.onclose = null; sock.onerror = null; sock.close(); } catch { /* */ } }
 }
 
 // Some thread entries are written by the CONTROL PLANE, not by this browser: an assistant's

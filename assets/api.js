@@ -183,8 +183,26 @@ const live = {
   // The project-wide activity feed: what every assistant has actually been DOING,
   // line by line (phases, tool calls, results). Beats oldest-first, and a running
   // beat's `activity` array grows between polls. Narrated in the builder's LEFT pane.
+  // Since phase 33 the SAME payload is what the WebSocket pushes (see `openStream` in
+  // app.js): {beats, beating, messages, dms, budget}. One shape, two transports, so the live
+  // view and the after-a-hard-refresh view cannot disagree — and so the pane needs only one
+  // merge path whether a frame arrived by push or by poll.
   assistantActivity: (id, limit) =>
     sub(id, `assistant-activity?limit=${encodeURIComponent(limit || 6)}`),
+
+  // --- messaging between assistants (phase 33) ---
+  // Named `/messages/assistants`, not `/messages`: the latter is the HUMAN thread. Two
+  // different conversations, two different URLs.
+  projectDms:    (id, limit)   =>
+    sub(id, `messages/assistants?limit=${encodeURIComponent(limit || 40)}`),
+  // Today's spend against the $10/day hard stop. `stopped: true` means assistant work has
+  // HALTED — not merely that it has been expensive.
+  projectBudget: (id)          => sub(id, "budget"),
+  // Moves the "N new since you were last here" high-water mark. A WRITE, called when the
+  // pane is actually being looked at — a GET that cleared it would clear it for a background
+  // tab, which is exactly the case the marker exists for.
+  projectSeen:   (id)          =>
+    req("POST", `/api/projects/${encodeURIComponent(id)}/seen`, {}),
 
   // --- the shared WORKSPACE (phase 32) ---
   // The work-tracker the build pipeline, every assistant and the user all write to:
