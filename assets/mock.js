@@ -270,6 +270,76 @@ async function streamPipeline(p, onEvent, { steps = PIPELINE_STEPS } = {}) {
   p.updated_at = new Date().toISOString();
 }
 
+// ---- the shared workspace board (phase 32) --------------------------------
+// Three authors on one board, on purpose: the build pipeline, an assistant and a human.
+const _iso = (minsAgo) => new Date(Date.now() - minsAgo * 60e3).toISOString();
+const MOCK_WORKSPACE = {
+  items: [
+    { id: 101, kind: "feature", title: "Create and list notes", body_md:
+        "Planned by the build pipeline as feature 1 of 12.", status: "done",
+      priority: "normal", assignee: "", created_by: "pipeline",
+      created_by_kind: "pipeline", created_by_name: "build pipeline",
+      created_at: _iso(320), updated_at: _iso(300), closed_at: _iso(300) },
+    { id: 102, kind: "feature", title: "Share a note by link", body_md:
+        "Planned by the build pipeline as feature 7 of 12.\n\n**Blocked:** failed twice "
+        + "(health gate red after the share route); reverted to last good commit",
+      status: "blocked", priority: "normal", assignee: "", created_by: "pipeline",
+      created_by_kind: "pipeline", created_by_name: "build pipeline",
+      created_at: _iso(320), updated_at: _iso(240) },
+    { id: 103, kind: "feature", title: "Full-text search across notes", body_md:
+        "Planned by the build pipeline as feature 9 of 12.", status: "in_progress",
+      priority: "normal", assignee: "", created_by: "pipeline",
+      created_by_kind: "pipeline", created_by_name: "build pipeline",
+      created_at: _iso(320), updated_at: _iso(20) },
+    { id: 104, kind: "bug", title: "Empty list renders no message at all", body_md:
+        "`/notes` with zero rows renders a blank panel. Seen in a real browser with "
+        + "`mikeweb check`; no JS errors, the list is simply empty.", status: "open",
+      priority: "normal", assignee: "", created_by: "assistant:2",
+      created_by_kind: "assistant", created_by_name: "Tester",
+      created_at: _iso(45), updated_at: _iso(45) },
+    { id: 105, kind: "kb", title: "Sessions are cookie-based, not JWT", body_md:
+        "Decided when auth was added: a signed cookie, `SameSite=Lax`. Anything reading "
+        + "`Authorization:` here is a mistake.", status: "open", priority: "normal",
+      assignee: "", created_by: "assistant:1", created_by_kind: "assistant",
+      created_by_name: "Product Owner", created_at: _iso(180), updated_at: _iso(180) },
+    { id: 106, kind: "doc", title: "How the share link is meant to work", body_md:
+        "A note gets an opaque 16-char slug; `/s/<slug>` renders read-only.",
+      status: "open", priority: "normal", assignee: "", created_by: "user:mock",
+      created_by_kind: "human", created_by_name: "you",
+      created_at: _iso(120), updated_at: _iso(120) },
+  ],
+  counts: { by_kind: { feature: 3, bug: 1, kb: 1, doc: 1 },
+            by_status: { done: 1, blocked: 1, in_progress: 1, open: 3 }, total: 6 },
+  kinds: ["feature", "bug", "task", "testcase", "doc", "kb"],
+  statuses: ["open", "in_progress", "blocked", "done", "rejected"],
+};
+const MOCK_WS_COMMENTS = {
+  102: [{ id: 1, author: "assistant:3", author_kind: "assistant", author_name: "Developer",
+          body_md: "The share route needs a migration the health gate never sees. I will "
+                   + "split it into two deploys.", created_at: _iso(200) }],
+  104: [{ id: 2, author: "assistant:3", author_kind: "assistant", author_name: "Developer",
+          body_md: "Reproduced. The template renders `{{#each}}` with no `{{else}}`.",
+          created_at: _iso(30) }],
+};
+const MOCK_WS_EVENTS = {
+  101: [{ id: 1, actor: "pipeline", actor_kind: "pipeline", actor_name: "build pipeline",
+          verb: "created", field: "kind", from_val: "", to_val: "feature", note:
+          "Create and list notes", ts: _iso(320) },
+        { id: 2, actor: "pipeline", actor_kind: "pipeline", actor_name: "build pipeline",
+          verb: "status", field: "status", from_val: "open", to_val: "in_progress",
+          note: "", ts: _iso(310) },
+        { id: 3, actor: "pipeline", actor_kind: "pipeline", actor_name: "build pipeline",
+          verb: "status", field: "status", from_val: "in_progress", to_val: "done",
+          note: "built and deployed — src/routes/notes.js, views/notes.ejs", ts: _iso(300) }],
+  102: [{ id: 4, actor: "pipeline", actor_kind: "pipeline", actor_name: "build pipeline",
+          verb: "status", field: "status", from_val: "in_progress", to_val: "blocked",
+          note: "failed twice (health gate red after the share route); reverted to last "
+                + "good commit", ts: _iso(240) }],
+  104: [{ id: 5, actor: "assistant:2", actor_kind: "assistant", actor_name: "Tester",
+          verb: "created", field: "kind", from_val: "", to_val: "bug",
+          note: "Empty list renders no message at all", ts: _iso(45) }],
+};
+
 export const mockApi = {
   async health() { return { status: "ok", database: "ok" }; },
 
@@ -343,6 +413,56 @@ export const mockApi = {
   async projectDeployments() { await wait(150); return MOCK_TABS.deployments; },
   async projectQa()          { await wait(150); return MOCK_TABS.qa; },
   async projectBacklog()     { await wait(140); return MOCK_TABS.backlog; },
+
+  // --- the shared WORKSPACE (phase 32) ---
+  // Deliberately MIXED authorship: the pipeline's features (one of them blocked, with the
+  // real reason), an assistant's bug, a human's note. `?mock=1` has to exercise the thing
+  // this tab is actually for — showing who did what — not just a list of rows.
+  async workspaceItems()     { await wait(140); return MOCK_WORKSPACE; },
+  async workspaceItem(id, itemId) {
+    await wait(110);
+    const it = MOCK_WORKSPACE.items.find((i) => String(i.id) === String(itemId));
+    if (!it) throw new Error("Not found");
+    return { item: { ...it, comments: MOCK_WS_COMMENTS[it.id] || [],
+                     events: MOCK_WS_EVENTS[it.id] || [], links: [] } };
+  },
+  async createWorkspaceItem(id, body) {
+    await wait(220);
+    const now = new Date().toISOString();
+    const item = { id: 900 + MOCK_WORKSPACE.items.length, kind: body.kind || "task",
+                   title: body.title, body_md: body.body_md || "",
+                   status: body.status || "open", priority: "normal", assignee: "",
+                   created_by: "user:mock", created_by_kind: "human", created_by_name: "you",
+                   created_at: now, updated_at: now };
+    MOCK_WORKSPACE.items.push(item);
+    MOCK_WORKSPACE.counts.total++;
+    MOCK_WORKSPACE.counts.by_kind[item.kind] = (MOCK_WORKSPACE.counts.by_kind[item.kind] || 0) + 1;
+    return { ok: true, item };
+  },
+  async patchWorkspaceItem(id, itemId, body) {
+    await wait(180);
+    const it = MOCK_WORKSPACE.items.find((i) => String(i.id) === String(itemId));
+    if (!it) throw new Error("Not found");
+    const from = it.status;
+    Object.assign(it, body, { updated_at: new Date().toISOString() });
+    (MOCK_WS_EVENTS[it.id] = MOCK_WS_EVENTS[it.id] || []).push({
+      id: Date.now(), actor: "user:mock", actor_kind: "human", actor_name: "you",
+      verb: "status", field: "status", from_val: from, to_val: it.status, note: "",
+      ts: new Date().toISOString() });
+    return { ok: true, item: it };
+  },
+  async commentWorkspaceItem(id, itemId, body_md) {
+    await wait(180);
+    const c = { id: Date.now(), author: "user:mock", author_kind: "human",
+                author_name: "you", body_md, created_at: new Date().toISOString() };
+    (MOCK_WS_COMMENTS[itemId] = MOCK_WS_COMMENTS[itemId] || []).push(c);
+    (MOCK_WS_EVENTS[itemId] = MOCK_WS_EVENTS[itemId] || []).push({
+      id: Date.now() + 1, actor: "user:mock", actor_kind: "human", actor_name: "you",
+      verb: "commented", field: "", from_val: "", to_val: "",
+      note: String(body_md).slice(0, 120), ts: new Date().toISOString() });
+    return { ok: true, comment: c };
+  },
+
   async projectRoutes()      { await wait(130); return MOCK_TABS.routes; },
   async projectMetrics()     { await wait(170); return MOCK_TABS.metrics; },
   async projectCache()       { await wait(130); return MOCK_TABS.cache; },

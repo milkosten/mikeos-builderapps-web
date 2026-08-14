@@ -1234,3 +1234,165 @@ button.aa-who {
 }
 button.aa-who:hover { text-decoration: underline; }
 button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+/* ---- Workspace: the shared work-tracker (phase 32) ----------------------- */
+/* One board written by three kinds of author — the build pipeline, the AI assistants and
+   the person. The single most important visual job here is that you can TELL THEM APART
+   at a glance: that is what makes an audit trail worth reading. */
+
+.ws-search {
+  flex: 0 1 260px; min-width: 120px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font: inherit; font-size: 12.5px; padding: 5px 9px;
+}
+.ws-search:focus { outline: none; border-color: var(--border-2); }
+.ws-filter {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font: inherit; font-size: 12.5px; padding: 5px 8px;
+}
+.ws-input {
+  width: 100%; background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text); font: inherit; font-size: 13px;
+  padding: 7px 10px; resize: vertical;
+}
+.ws-input:focus, .ws-filter:focus { outline: none; border-color: var(--accent); }
+.ws-label { display: block; font-size: 11.5px; font-weight: 700; letter-spacing: .3px;
+  text-transform: uppercase; color: var(--text-mute); margin-top: 4px; }
+
+.ws-summary {
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  font-size: 12.5px; color: var(--text-dim);
+}
+.ws-sum-done { color: #b6f5c9; }
+.ws-sum-blocked { color: #ffc2c2; }
+.ws-sum-hint { color: var(--text-mute); }
+
+.ws-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ws-chip {
+  border: 1px solid var(--border); background: var(--bg-2); color: var(--text-dim);
+  border-radius: 999px; padding: 3px 11px; font-size: 12px; cursor: pointer;
+}
+.ws-chip:hover { border-color: var(--border-2); color: var(--text); }
+.ws-chip.on { border-color: var(--accent); background: rgba(109,139,255,.13); color: #cbd5f5; }
+
+.ws-board { display: flex; flex-direction: column; gap: 16px; }
+.ws-group-head {
+  display: flex; align-items: center; gap: 8px; padding: 0 2px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.ws-group-icon { color: var(--text-mute); }
+.ws-group-name {
+  font-size: 12px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.ws-group-n {
+  font-size: 11px; color: var(--text-mute); border: 1px solid var(--border);
+  border-radius: 999px; padding: 0 7px;
+}
+.ws-rows { display: flex; flex-direction: column; }
+
+.ws-row {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  background: transparent; border: 0; border-bottom: 1px solid var(--border);
+  padding: 9px 4px; cursor: pointer; color: var(--text); font: inherit;
+}
+.ws-row:hover { background: var(--panel); }
+.ws-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.ws-row.done .ws-title { color: var(--text-mute); }
+.ws-row.blocked { box-shadow: inset 3px 0 0 rgba(248,113,113,.65); }
+.ws-id { flex: 0 0 auto; color: var(--text-mute); font-size: 11.5px; }
+.ws-title { flex: 1; min-width: 0; font-size: 13.5px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.ws-when { flex: 0 0 auto; font-size: 11.5px; color: var(--text-mute); }
+
+.ws-status {
+  flex: 0 0 auto; font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .5px; border: 1px solid var(--border-2); border-radius: 999px;
+  padding: 2px 9px; color: var(--text-mute); white-space: nowrap;
+}
+.ws-status.s-done { color: #b6f5c9; border-color: rgba(74,222,128,.5); background: rgba(74,222,128,.12); }
+.ws-status.s-in_progress { color: #cbd5f5; border-color: rgba(109,139,255,.5); background: rgba(109,139,255,.12); }
+.ws-status.s-blocked { color: #ffc2c2; border-color: rgba(248,113,113,.6); background: rgba(248,113,113,.14); }
+.ws-status.s-rejected { color: var(--text-mute); text-decoration: line-through; }
+
+/* Who did it. A person, an agent and the pipeline must never look the same. */
+.ws-actor {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11.5px; color: var(--text-mute); white-space: nowrap;
+}
+.ws-actor-mark { font-size: 10px; }
+.ws-actor.k-human { color: #b6f5c9; }
+.ws-actor.k-assistant { color: #cbb6f5; }
+.ws-actor.k-pipeline { color: var(--text-mute); }
+.ws-actor.k-agent { color: var(--text-dim); }
+
+/* ---- one item ---- */
+.ws-detail-head { display: flex; flex-direction: column; gap: 6px; }
+.ws-detail-title { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap;
+  font-size: 17px; font-weight: 650; letter-spacing: -.01em; }
+.ws-kind-tag {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px;
+  border: 1px solid var(--border-2); border-radius: 999px; padding: 2px 9px;
+  color: var(--text-dim);
+}
+.ws-detail-meta { display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  font-size: 12px; color: var(--text-mute); }
+.ws-detail-meta .muted-note { margin: 0; }
+
+.ws-statusbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ws-sb-label { font-size: 11.5px; font-weight: 700; letter-spacing: .4px;
+  text-transform: uppercase; color: var(--text-mute); margin-right: 4px; }
+.ws-sb-btn {
+  border: 1px solid var(--border); background: var(--bg-2); color: var(--text-dim);
+  border-radius: 999px; padding: 3px 12px; font-size: 12px; cursor: pointer;
+}
+.ws-sb-btn:hover:not(:disabled) { border-color: var(--border-2); color: var(--text); }
+.ws-sb-btn.on { border-color: var(--accent); background: rgba(109,139,255,.15); color: #cbd5f5; }
+.ws-sb-btn:disabled { cursor: default; opacity: .85; }
+
+.ws-body {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 12px 14px;
+}
+.ws-sec-head {
+  font-size: 11.5px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase;
+  color: var(--text-mute); margin-bottom: 8px;
+}
+.ws-links { display: flex; flex-direction: column; }
+.ws-link-row {
+  display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+  background: transparent; border: 0; border-bottom: 1px solid var(--border);
+  padding: 7px 4px; cursor: pointer; color: var(--text); font: inherit;
+}
+.ws-link-row:hover { background: var(--panel); }
+.ws-link-rel { flex: 0 0 auto; font-size: 11.5px; color: var(--text-mute); }
+
+.ws-comments { display: flex; flex-direction: column; gap: 10px; }
+.ws-comment {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 9px 12px;
+}
+.ws-comment-head { display: flex; align-items: center; gap: 9px; margin-bottom: 4px; }
+.ws-comment .md { font-size: 13px; }
+.ws-composer { display: flex; flex-direction: column; align-items: flex-end; gap: 7px; }
+.ws-comment-box {
+  width: 100%; background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text); font: inherit; font-size: 13px;
+  padding: 8px 10px; resize: vertical;
+}
+.ws-comment-box:focus { outline: none; border-color: var(--accent); }
+
+/* The audit trail. Dense on purpose — it is a log, and a log you can scan is a log
+   people actually read. */
+.ws-events { display: flex; flex-direction: column; }
+.ws-event {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  padding: 5px 4px; border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.ws-ev-when { flex: 0 0 auto; color: var(--text-mute); font-size: 11.5px; min-width: 66px; }
+.ws-ev-verb { color: var(--text-dim); font-weight: 650; }
+.ws-ev-delta { display: inline-flex; align-items: baseline; gap: 5px; color: var(--text-mute); }
+.ws-ev-from { text-decoration: line-through; }
+.ws-ev-to { color: var(--text); }
+.ws-ev-note { flex: 1 1 100%; color: var(--text-mute); font-size: 11.5px;
+  padding-left: 74px; line-height: 1.45; }

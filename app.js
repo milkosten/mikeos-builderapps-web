@@ -51,6 +51,16 @@ const state = {
   asstBusy: false,    // an assistant action is in flight (disables the buttons)
   asstPoll: null,     // interval id: a running beat is polled until it finishes
 
+  // ----- Workspace tab (phase 32): the shared work-tracker -----
+  wsKind: "",         // kind filter ("" = every kind, grouped)
+  wsStatus: "",       // status filter ("" = every status)
+  wsQuery: "",        // free-text filter, applied client-side over the fetched board
+  wsSel: null,        // id of the open item (null = the grouped board)
+  wsDetail: null,     // { id, loading, error, data } — data is the FULL item from the API
+  wsBusy: false,      // a write is in flight (disables the controls)
+  wsDraft: "",        // the comment box, held here so a repaint does not eat what was typed
+  wsDialog: null,     // the "+ New item" form, or null when closed
+
   // Executed pipeline steps rebuilt FROM THE SERVER (latest_run.steps) on load.
   // Kept out of state.messages so it never pollutes the persisted thread.
   runHistory: null,   // { kind, request, status, steps:[{label,pending,failed}] }
@@ -1386,6 +1396,11 @@ const TABS = {
   // Pinned deliberately: an assistant you have to go looking for in the "+" menu is an
   // assistant nobody starts.
   assistants:  { label: "Assistants",   pinned: true,  icon: "✦" },
+  // Pinned for the same reason as Assistants, and a stronger one: this is the tab that
+  // answers "what has actually been built, and what got skipped?" — the first question a
+  // user has. A tracker behind the "+" menu is a tracker nobody reads, and then the
+  // pipeline and the assistants are writing into a void.
+  workspace:   { label: "Workspace",    pinned: true,  icon: "☑" },
   code:        { label: "Code",         pinned: true,  icon: "‹›" },
   database:    { label: "Database",     pinned: true,  icon: "▤" },
   secrets:     { label: "Secrets",      pinned: true,  icon: "🔑" },
@@ -1640,6 +1655,10 @@ document.addEventListener("click", () => {
 const TAB_FETCH = {
   goals:       (id) => api.projectDocs(id),
   assistants:  (id) => api.assistants(id),
+  // The board is fetched WHOLE and filtered client-side. It is a few hundred rows at most,
+  // and filtering locally is what keeps the status pills instant instead of costing a round
+  // trip each — the server-side filters exist for the API's other clients (`ws`, scripts).
+  workspace:   (id) => api.workspaceItems(id),
   code:        (id) => api.projectFiles(id, state.codePath || ""),
   database:    (id) => api.projectDatabase(id),
   secrets:     (id) => api.projectSecrets(id, state.secretsRevealed),
@@ -1762,6 +1781,7 @@ function tabBody(tab) {
     case "site":        return siteTab();
     case "goals":       return goalsTab();
     case "assistants":  return assistantsTab();
+    case "workspace":   return workspaceTab();
     case "code":        return codeTab();
     case "database":    return databaseTab();
     case "secrets":     return secretsTab();
@@ -2091,6 +2111,364 @@ function backlogTab() {
     return tabPane(list);
   });
 }
+
+// ----- Workspace: the shared work-tracker (phase 32) -----
+// One board that the build pipeline, every AI assistant and the user all write to. The
+// pipeline files each backlog feature and drives it open -> in_progress -> done (or
+// `blocked`, carrying WHY it was skipped); the assistants file bugs, notes and knowledge;
+// the user comments and changes statuses here.
+//
+// TWO RULES THIS RENDERER MUST NOT BREAK:
+//
+// 1. **The taxonomy comes from the server.** `kind` and `status` are free text end to end,
+//    so the filters are built from `data.kinds`/`data.statuses` (which include whatever
+//    actually exists) plus whatever the rows carry. A hardcoded list here would silently
+//    hide an assistant's `risk` item and nobody would ever know why.
+// 2. **Never repaint more than the right panel.** Everything here goes through
+//    repaintRight(); the chat thread and the preview iframe must not be rebuilt, and the
+//    comment box's text lives in `state.wsDraft` so a repaint cannot eat what was typed.
+
+// Statuses the board treats as finished — only for styling and for the "N of M done"
+// counter. Anything else is live work. Still not a vocabulary: an unknown status simply
+// renders as itself and counts as live.
+const WS_DONE = ["done", "rejected", "closed", "cancelled", "wontfix"];
+const WS_KIND_ICON = { feature: "◆", bug: "⚠", task: "•", testcase: "✓", doc: "▤", kb: "✱" };
+
+function wsIcon(kind) { return WS_KIND_ICON[String(kind || "").toLowerCase()] || "▸"; }
+function wsIsDone(s) { return WS_DONE.includes(String(s || "").toLowerCase()); }
+
+// Who did it, rendered so a human can tell a person from an agent at a glance. This is the
+// whole point of storing the actor as a triple server-side.
+function wsActor(kind, name) {
+  const k = String(kind || "").toLowerCase();
+  const label = name || (k === "pipeline" ? "the build pipeline" : "someone");
+  return el("span", { class: "ws-actor k-" + (k || "unknown"), title: k },
+    el("span", { class: "ws-actor-mark" },
+      k === "human" ? "◍" : k === "pipeline" ? "⚙" : "✦"),
+    el("span", {}, label));
+}
+
+function wsStatusPill(s) {
+  const k = String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  return el("span", { class: "ws-status s-" + k }, String(s || "—").replace(/_/g, " "));
+}
+
+async function loadWsItem(id, { force = false } = {}) {
+  if (!state.project) return;
+  const cur = state.wsDetail;
+  if (!force && cur && cur.id === id && (cur.loading || cur.data)) return;
+  state.wsDetail = { id, loading: true };
+  if (state.tab === "workspace") repaintRight();
+  let next;
+  try { next = { id, data: (await api.workspaceItem(state.project.id, id)).item }; }
+  catch (e) { next = { id, error: (e && e.message) || "Could not load this item." }; }
+  // Ignore a response that arrived after the user opened a different item or left.
+  if (!state.project || state.wsSel !== id) return;
+  state.wsDetail = next;
+  if (state.tab === "workspace") repaintRight();
+}
+
+function openWsItem(id) {
+  state.wsSel = id;
+  state.wsDraft = "";
+  state.wsDetail = null;
+  repaintRight();
+  loadWsItem(id);
+}
+
+function closeWsItem() {
+  state.wsSel = null;
+  state.wsDetail = null;
+  state.wsDraft = "";
+  // The board is refetched because the item that was just open may have changed status,
+  // and a stale count in the header is exactly the kind of small lie that erodes trust.
+  loadTab("workspace", { force: true });
+  repaintRight();
+}
+
+async function wsSetStatus(id, status) {
+  if (state.wsBusy) return;
+  state.wsBusy = true; repaintRight();
+  try {
+    await guard(() => api.patchWorkspaceItem(state.project.id, id, { status }));
+    await loadWsItem(id, { force: true });
+    toast("Status set to " + status);
+  } catch { /* guard() already told the user */ }
+  finally { state.wsBusy = false; repaintRight(); }
+}
+
+async function wsComment(id) {
+  const text = (state.wsDraft || "").trim();
+  if (!text || state.wsBusy) return;
+  state.wsBusy = true; repaintRight();
+  try {
+    await guard(() => api.commentWorkspaceItem(state.project.id, id, text));
+    state.wsDraft = "";
+    await loadWsItem(id, { force: true });
+  } catch { /* guard() already told the user */ }
+  finally { state.wsBusy = false; repaintRight(); }
+}
+
+async function wsCreate(body) {
+  state.wsBusy = true; repaintRight();
+  try {
+    const res = await guard(() => api.createWorkspaceItem(state.project.id, body));
+    state.wsDialog = null;
+    await loadTab("workspace", { force: true });
+    toast("Item created");
+    if (res && res.item) openWsItem(res.item.id);
+  } catch { /* guard() already told the user */ }
+  finally { state.wsBusy = false; repaintRight(); }
+}
+
+function workspaceTab() {
+  if (state.wsSel) return wsDetailPane();
+
+  return withTab("workspace", (data) => {
+    const all = data.items || [];
+    const counts = data.counts || {};
+    // The vocabularies are the server's, plus anything the rows themselves carry — so a
+    // kind invented by an assistant appears here with no deploy.
+    const kinds = Array.from(new Set([...(data.kinds || []), ...all.map((i) => i.kind)]))
+      .filter(Boolean);
+    const statuses = Array.from(new Set([...(data.statuses || []), ...all.map((i) => i.status)]))
+      .filter(Boolean);
+
+    const q = (state.wsQuery || "").trim().toLowerCase();
+    const rows = all.filter((i) =>
+      (!state.wsKind || i.kind === state.wsKind) &&
+      (!state.wsStatus || i.status === state.wsStatus) &&
+      (!q || (i.title || "").toLowerCase().includes(q) ||
+             (i.body_md || "").toLowerCase().includes(q)));
+
+    const done = all.filter((i) => wsIsDone(i.status)).length;
+    const blocked = all.filter((i) => String(i.status).toLowerCase() === "blocked").length;
+
+    const bar = tabToolbar(
+      el("button", { class: "btn primary sm", onclick: () => { state.wsDialog = {}; repaintRight(); } },
+        "＋ New item"),
+      el("input", {
+        class: "ws-search", type: "search", placeholder: "Search the board…",
+        value: state.wsQuery || "",
+        oninput: (e) => { state.wsQuery = e.target.value; repaintRight();
+                          // keep the caret where the user left it after the repaint
+                          const n = document.querySelector(".ws-search");
+                          if (n) { n.focus(); n.setSelectionRange(n.value.length, n.value.length); } },
+      }),
+      el("div", { class: "spacer" }),
+      el("select", {
+        class: "ws-filter",
+        onchange: (e) => { state.wsStatus = e.target.value; repaintRight(); },
+      }, [el("option", { value: "" }, "Any status"),
+          ...statuses.map((s) => el("option",
+            { value: s, selected: state.wsStatus === s }, s.replace(/_/g, " ")))]),
+      el("button", { class: "btn sm", onclick: () => loadTab("workspace", { force: true }) },
+        "Refresh"));
+
+    if (!all.length) {
+      return tabPane(bar, el("div", { class: "tab-empty" },
+        el("div", { class: "te-mark" }, "☑"),
+        el("div", { class: "te-text" },
+          "Nothing on the board yet. The build pipeline files every feature it plans here "
+          + "(and every one it has to skip, with the reason), your assistants file what they "
+          + "find, and you can add anything yourself.")),
+        state.wsDialog ? wsDialog(kinds, statuses) : null);
+    }
+
+    const summary = el("div", { class: "ws-summary" },
+      el("span", {}, `${all.length} item${all.length === 1 ? "" : "s"}`),
+      el("span", { class: "ws-sum-done" }, `${done} done`),
+      blocked ? el("span", { class: "ws-sum-blocked" }, `${blocked} blocked`) : null,
+      el("span", { class: "ws-sum-hint" },
+        "filed by the pipeline, your assistants and you"));
+
+    // Kind chips double as the filter and as the legend. Counts come from the SERVER's
+    // totals, not the filtered view, so switching a status filter does not make the board
+    // look like items vanished.
+    const chips = el("div", { class: "ws-chips" },
+      el("button", {
+        class: "ws-chip" + (state.wsKind ? "" : " on"),
+        onclick: () => { state.wsKind = ""; repaintRight(); },
+      }, `All (${all.length})`),
+      kinds.filter((k) => (counts.by_kind || {})[k]).map((k) =>
+        el("button", {
+          class: "ws-chip" + (state.wsKind === k ? " on" : ""),
+          onclick: () => { state.wsKind = state.wsKind === k ? "" : k; repaintRight(); },
+        }, `${wsIcon(k)} ${k} (${(counts.by_kind || {})[k]})`)));
+
+    if (!rows.length) {
+      return tabPane(bar, summary, chips,
+        tabEmpty("Nothing matches these filters."),
+        state.wsDialog ? wsDialog(kinds, statuses) : null);
+    }
+
+    // Grouped by kind — the user's mental model is "features / bugs / docs", not one flat
+    // list sorted by id.
+    const groups = [];
+    for (const k of kinds) {
+      const inKind = rows.filter((i) => i.kind === k);
+      if (inKind.length) groups.push([k, inKind]);
+    }
+    for (const i of rows) if (!kinds.includes(i.kind)) {   // belt and braces
+      const g = groups.find(([k]) => k === i.kind);
+      if (g) g[1].push(i); else groups.push([i.kind, [i]]);
+    }
+
+    const board = el("div", { class: "ws-board" });
+    for (const [kind, items] of groups) {
+      board.appendChild(el("div", { class: "ws-group" },
+        el("div", { class: "ws-group-head" },
+          el("span", { class: "ws-group-icon" }, wsIcon(kind)),
+          el("span", { class: "ws-group-name" }, kind),
+          el("span", { class: "ws-group-n" }, String(items.length))),
+        el("div", { class: "ws-rows" }, items.map(wsRow))));
+    }
+    return tabPane(bar, summary, chips, board, state.wsDialog ? wsDialog(kinds, statuses) : null);
+  });
+}
+
+function wsRow(it) {
+  return el("button", {
+    class: "ws-row" + (wsIsDone(it.status) ? " done" : "")
+           + (String(it.status).toLowerCase() === "blocked" ? " blocked" : ""),
+    onclick: () => openWsItem(it.id),
+  },
+    el("span", { class: "ws-id mono" }, "#" + it.id),
+    el("span", { class: "ws-title" }, it.title || "(untitled)"),
+    wsStatusPill(it.status),
+    wsActor(it.created_by_kind, it.created_by_name),
+    el("span", { class: "ws-when" }, fmtDate(it.updated_at || it.created_at)));
+}
+
+// ----- one item: body + comments + the event trail -----
+function wsDetailPane() {
+  const d = state.wsDetail;
+  const back = el("button", { class: "btn sm", onclick: closeWsItem }, "← Back to the board");
+  if (!d || d.loading) return tabPane(tabToolbar(back), tabLoading());
+  if (d.error) return tabPane(tabToolbar(back),
+    tabError(d.error, () => loadWsItem(d.id, { force: true })));
+  const it = d.data || {};
+
+  const statuses = Array.from(new Set([
+    "open", "in_progress", "blocked", "done", "rejected", it.status].filter(Boolean)));
+
+  const head = el("div", { class: "ws-detail-head" },
+    el("div", { class: "ws-detail-title" },
+      el("span", { class: "ws-id mono" }, "#" + it.id),
+      el("span", { class: "ws-kind-tag" }, `${wsIcon(it.kind)} ${it.kind}`),
+      el("span", {}, it.title || "(untitled)")),
+    el("div", { class: "ws-detail-meta" },
+      el("span", {}, "filed by "), wsActor(it.created_by_kind, it.created_by_name),
+      el("span", { class: "muted-note" }, " · " + fmtDate(it.created_at)),
+      it.assignee ? el("span", { class: "muted-note" }, " · assigned to " + it.assignee) : null));
+
+  // Changing a status is one click, and it is recorded against YOU in the trail below —
+  // the same machinery an assistant's change goes through.
+  const statusBar = el("div", { class: "ws-statusbar" },
+    el("span", { class: "ws-sb-label" }, "Status"),
+    statuses.map((s) => el("button", {
+      class: "ws-sb-btn" + (s === it.status ? " on" : ""),
+      disabled: state.wsBusy || s === it.status,
+      onclick: () => wsSetStatus(it.id, s),
+    }, s.replace(/_/g, " "))));
+
+  const body = (it.body_md || "").trim()
+    ? el("article", { class: "md ws-body", html: mdToHtml(it.body_md) })
+    : el("div", { class: "ws-body muted-note" }, "No description.");
+
+  const links = (it.links || []).length ? el("div", { class: "ws-links" },
+    el("div", { class: "ws-sec-head" }, "Linked"),
+    (it.links || []).map((l) => el("button", {
+      class: "ws-link-row", onclick: () => openWsItem(l.other_id),
+    },
+      el("span", { class: "ws-link-rel" },
+        (l.direction === "out" ? "→ " : "← ") + (l.link_rel || "relates")),
+      el("span", { class: "ws-id mono" }, "#" + l.other_id),
+      el("span", { class: "ws-title" }, l.other_title || ""),
+      wsStatusPill(l.other_status)))) : null;
+
+  const comments = el("div", { class: "ws-comments" },
+    el("div", { class: "ws-sec-head" },
+      `Comments (${(it.comments || []).length})`),
+    (it.comments || []).length
+      ? (it.comments || []).map((c) => el("div", { class: "ws-comment" },
+          el("div", { class: "ws-comment-head" },
+            wsActor(c.author_kind, c.author_name),
+            el("span", { class: "muted-note" }, fmtDate(c.created_at))),
+          el("article", { class: "md", html: mdToHtml(c.body_md || "") })))
+      : el("div", { class: "muted-note" }, "No comments yet."));
+
+  const composer = el("div", { class: "ws-composer" },
+    el("textarea", {
+      class: "ws-comment-box", rows: 3, placeholder: "Add a comment…",
+      value: state.wsDraft || "",
+      oninput: (e) => { state.wsDraft = e.target.value; },   // NO repaint: it would steal focus
+    }),
+    el("button", {
+      class: "btn primary sm", disabled: state.wsBusy,
+      onclick: () => wsComment(it.id),
+    }, state.wsBusy ? "Saving…" : "Comment"));
+
+  // The audit trail. This is the answer to "who changed this, a human or an agent?" — and
+  // the reason the tracker is trustworthy enough to act on.
+  const events = el("div", { class: "ws-events" },
+    el("div", { class: "ws-sec-head" }, "History"),
+    (it.events || []).map((e) => el("div", { class: "ws-event" },
+      el("span", { class: "ws-ev-when" }, fmtDate(e.ts)),
+      wsActor(e.actor_kind, e.actor_name),
+      el("span", { class: "ws-ev-verb" }, e.verb),
+      (e.from_val || e.to_val)
+        ? el("span", { class: "ws-ev-delta" },
+            el("span", { class: "ws-ev-from" }, e.from_val || "—"),
+            el("span", {}, "→"),
+            el("span", { class: "ws-ev-to" }, e.to_val || "—"))
+        : null,
+      e.note ? el("span", { class: "ws-ev-note" }, e.note) : null)));
+
+  return tabPane(tabToolbar(back), head, statusBar, body, links, comments, composer, events);
+}
+
+// ----- "+ New item" -----
+function wsDialog(kinds, statuses) {
+  const kindSel = el("select", { class: "ws-filter" },
+    (kinds && kinds.length ? kinds : ["feature", "bug", "task", "testcase", "doc", "kb"])
+      .map((k) => el("option", { value: k, selected: k === "task" }, k)));
+  const titleIn = el("input", { class: "ws-input", type: "text",
+                                placeholder: "What is it? One line." });
+  const bodyIn = el("textarea", { class: "ws-input", rows: 5,
+                                  placeholder: "The details someone else could act on (Markdown)." });
+  const statusSel = el("select", { class: "ws-filter" },
+    (statuses && statuses.length ? statuses : ["open", "in_progress", "blocked", "done"])
+      .map((s) => el("option", { value: s, selected: s === "open" }, s.replace(/_/g, " "))));
+
+  // The same modal chrome the "+ Start an assistant" dialog uses (`asst-modal*`) — one
+  // dialog style in this app, not two that drift apart.
+  return el("div", { class: "asst-modal", onclick: (e) => {
+    if (e.target.classList.contains("asst-modal")) { state.wsDialog = null; repaintRight(); }
+  } },
+    el("div", { class: "asst-modal-box" },
+      el("div", { class: "asst-modal-head" },
+        el("span", { class: "cb-title" }, "New workspace item")),
+      el("label", { class: "ws-label" }, "Kind"), kindSel,
+      el("div", { class: "muted-note" },
+        "Free text server-side — these are the conventions, not a limit."),
+      el("label", { class: "ws-label" }, "Title"), titleIn,
+      el("label", { class: "ws-label" }, "Details"), bodyIn,
+      el("label", { class: "ws-label" }, "Status"), statusSel,
+      el("div", { class: "asst-modal-foot" },
+        el("button", { class: "btn sm", onclick: () => { state.wsDialog = null; repaintRight(); } },
+          "Cancel"),
+        el("button", {
+          class: "btn primary sm", disabled: state.wsBusy,
+          onclick: () => {
+            const title = titleIn.value.trim();
+            if (!title) { toast("A title is required", "err"); return; }
+            wsCreate({ kind: kindSel.value, title, body_md: bodyIn.value,
+                       status: statusSel.value });
+          },
+        }, state.wsBusy ? "Saving…" : "Create"))));
+}
+
 function routesTab() {
   return withTab("routes", (data) => {
     const rows = data.routes || [];
@@ -3161,6 +3539,10 @@ function resetBuilder() {
   state.codePath = ""; state.codeFile = null;
   state.secretsRevealed = false;
   state.danger = { busy: false, confirm: "" };
+  // The workspace board belongs to the project being left — filters, the open item and a
+  // half-typed comment all included. Carrying an item id across projects would 404 on open.
+  state.wsKind = ""; state.wsStatus = ""; state.wsQuery = "";
+  state.wsSel = null; state.wsDetail = null; state.wsDraft = ""; state.wsDialog = null;
 }
 
 // THE FIX for "reloading /builder wipes everything": the full workspace is rebuilt

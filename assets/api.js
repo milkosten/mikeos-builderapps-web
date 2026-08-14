@@ -185,6 +185,26 @@ const live = {
   // beat's `activity` array grows between polls. Narrated in the builder's LEFT pane.
   assistantActivity: (id, limit) =>
     sub(id, `assistant-activity?limit=${encodeURIComponent(limit || 6)}`),
+
+  // --- the shared WORKSPACE (phase 32) ---
+  // The work-tracker the build pipeline, every assistant and the user all write to:
+  // features, bugs, tasks, test cases, docs and knowledge-base notes, each with a status,
+  // comments and a full record of who changed what. `kind` and `status` are FREE TEXT
+  // server-side — the UI groups by whatever comes back in `kinds`/`statuses` and must never
+  // hardcode a vocabulary of its own. `workspaceItem` returns the WHOLE item (body +
+  // comments + event trail + links) in ONE call, so opening one costs a single request.
+  workspaceItems: (id, params) =>
+    sub(id, "items" + (params ? "?" + new URLSearchParams(params).toString() : "")),
+  workspaceItem: (id, itemId) => sub(id, `items/${encodeURIComponent(itemId)}`),
+  createWorkspaceItem: (id, body) =>
+    req("POST", `/api/projects/${encodeURIComponent(id)}/items`, body),
+  patchWorkspaceItem: (id, itemId, body) =>
+    req("PATCH",
+        `/api/projects/${encodeURIComponent(id)}/items/${encodeURIComponent(itemId)}`, body),
+  commentWorkspaceItem: (id, itemId, body_md) =>
+    req("POST",
+        `/api/projects/${encodeURIComponent(id)}/items/${encodeURIComponent(itemId)}/comments`,
+        { body_md }),
 };
 
 // The exported client picks live or mock at module-load time.
