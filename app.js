@@ -916,7 +916,11 @@ function assistantBeatBubble(b) {
     cost ? el("span", { class: "aa-cost" }, cost) : null));
 
   const trigger = b.trigger_kind === "ask" ? "you asked"
-                : b.trigger_kind === "schedule" ? "scheduled beat" : "manual beat";
+                : b.trigger_kind === "schedule" ? "scheduled beat"
+                // phase 31: the platform started this beat because the agent's own deploy
+                // failed. Saying "manual beat" would credit the user with something the
+                // control plane did, which is exactly the attribution this feed is for.
+                : b.trigger_kind === "repair" ? "its deploy failed" : "manual beat";
   const outcome = running ? "working…" : status === "skipped" ? "nothing to do"
                 : status === "failed" ? "failed" : "finished";
   bubble.appendChild(el("div", { class: "aa-sub" },
@@ -3405,6 +3409,7 @@ async function refreshAssistantActivity() {
     // from one project into another's thread.
     if (!state.project || state.project.id !== proj.id) return;
     state.assistantActivity = (feed && Array.isArray(feed.beats)) ? feed : null;
+    mergeServerMessages(feed && feed.messages);
     activityMisses = 0;
     repaintLeft("poll");// gated by leftSignature(): a no-op poll paints nothing
   } catch (e) {
@@ -3413,6 +3418,30 @@ async function refreshAssistantActivity() {
   } finally {
     activityInFlight = false;
   }
+}
+
+// Some thread entries are written by the CONTROL PLANE, not by this browser: an assistant's
+// comment, and — the reason this exists — a deploy-failure `@message`. They are already in
+// the same `messages` thread everything else lives in, so they need no rendering of their
+// own; they just have to make it INTO state.messages, which otherwise only ever grows from
+// things the user did in this tab.
+//
+// Append-only and matched on text, deliberately. `persistMessages()` PUTs this array back and
+// the server REPLACES the thread with it, so a client that never learned about a server-side
+// entry would delete it on its next write — the user would watch the failure message appear
+// and then vanish. Merging on every poll closes that window.
+function mergeServerMessages(list) {
+  if (!Array.isArray(list) || !list.length) return;
+  const seen = new Set(state.messages.map((m) => (m.text || "").trim()));
+  let added = 0;
+  for (const m of list) {
+    const text = String((m && m.text) || "").trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    pushMessage(m.role === "user" ? "user" : "assistant", { text });
+    added++;
+  }
+  if (added) persistMessages();
 }
 
 // Best-effort fetch of the OIDC userinfo for a richer Profile (name/email/avatar).
