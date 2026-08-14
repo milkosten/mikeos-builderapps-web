@@ -886,3 +886,4 @@ a.btn { text-decoration: none; }
   .doc-list { border-right: 0; border-bottom: 1px solid var(--border); }
   .kv-key { flex-basis: 130px; }
 }
+.run-head .run-req { font-style: italic; color: var(--text-mute); }

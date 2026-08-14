@@ -734,11 +734,12 @@ function stepList(steps) {
 // state.messages so it is never persisted back as chat text.
 function runHistoryBubble(run) {
   const kind = run.kind === "update" ? "Update run" : "Build run";
-  const head = run.request
-    ? `**${kind}** — *${run.request}*`
-    : `**${kind}**`;
   const bubble = el("div", { class: "bubble run-history" });
-  bubble.appendChild(el("div", { class: "run-head", html: mdInline(head) }));
+  // Built from elements, not markdown — mdInline has no italics, so a template
+  // string here would print literal asterisks.
+  bubble.appendChild(el("div", { class: "run-head" },
+    el("strong", {}, kind),
+    run.request ? el("span", { class: "run-req" }, " — " + run.request) : null));
   if (run.steps && run.steps.length) bubble.appendChild(stepList(run.steps));
   else bubble.appendChild(el("div", { class: "empty" }, "No steps recorded for this run yet."));
   if (run.status === "running") {
