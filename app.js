@@ -1015,9 +1015,13 @@ function dmBubble(m) {
       `Two assistants replying to each other indefinitely is real money and no product, ` +
       `so work that still needs doing goes on the Workspace board instead.`));
   } else if (blocked === "budget") {
+    // HELD, not stopped — and the difference is real, not a softer word for the same thing.
+    // The scheduler releases these and wakes the recipient the moment the app can afford a
+    // beat again (messaging.release_budget_holds), so this promise is one the system keeps.
     bubble.appendChild(el("div", { class: "dm-stop" },
-      "Not delivered — this app reached its daily assistant budget, so no beat was started. " +
-      "The message is held, not lost; it can be read on the recipient's next ordinary beat."));
+      "Held — this app reached its daily assistant budget, so no beat was started for it. " +
+      "It is not lost: it will be delivered, and the recipient woken, as soon as the budget " +
+      "resets at midnight UTC."));
   } else if (blocked) {
     bubble.appendChild(el("div", { class: "dm-stop" }, "Not delivered (" + blocked + ")."));
   }
