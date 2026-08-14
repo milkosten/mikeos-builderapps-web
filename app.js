@@ -1090,7 +1090,12 @@ function assistantBeatBubble(b) {
                 // phase 31: the platform started this beat because the agent's own deploy
                 // failed. Saying "manual beat" would credit the user with something the
                 // control plane did, which is exactly the attribution this feed is for.
-                : b.trigger_kind === "repair" ? "its deploy failed" : "manual beat";
+                : b.trigger_kind === "repair" ? "its deploy failed"
+                // phase 33: a colleague messaged it and the scheduler started this beat so it
+                // could read that message. Labelling it "manual" credits the user with a beat
+                // they did not start and hides the causation the timeline exists to show —
+                // the DM is rendered directly above it, and the two are one event.
+                : b.trigger_kind === "dm" ? "woken by a message" : "manual beat";
   const outcome = running ? "working…" : status === "skipped" ? "nothing to do"
                 : status === "failed" ? "failed" : "finished";
   bubble.appendChild(el("div", { class: "aa-sub" },
@@ -1102,8 +1107,13 @@ function assistantBeatBubble(b) {
   // survives a reload) rather than being matched up with the chat thread by guesswork.
   const ask = String(b.user_ask || "").trim();
   if (ask) {
+    // …and say WHO asked. On a DM beat this text is the colleague's message plus the whole
+    // workspace item it referenced, so "you asked" would attribute a message the user never
+    // wrote — and it is the field a reader uses to judge whether the beat did what it was
+    // asked, so getting the asker wrong makes the judgement wrong.
     bubble.appendChild(el("div", { class: "aa-ask" },
-      el("div", { class: "aa-ask-lbl" }, "you asked"),
+      el("div", { class: "aa-ask-lbl" },
+        b.trigger_kind === "dm" ? "a colleague asked" : "you asked"),
       el("div", { class: "aa-ask-txt" }, ask)));
   }
 
