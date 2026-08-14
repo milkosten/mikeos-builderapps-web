@@ -191,6 +191,9 @@ function fmtDate(s) {
   const d = new Date(s);
   if (isNaN(d)) return "";
   const diff = (Date.now() - d.getTime()) / 1000;
+  // A FUTURE timestamp (e.g. a certificate expiry) is not "just now" — the
+  // relative form only makes sense looking backwards.
+  if (diff < 0) return d.toLocaleDateString();
   if (diff < 60) return "just now";
   if (diff < 3600) return Math.floor(diff / 60) + "m ago";
   if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
