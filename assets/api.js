@@ -10,6 +10,7 @@
 //   PUT  /api/projects/{id}/messages {messages:[{role,text}]}  -> persist the chat thread
 //   GET  /api/projects/{id}/steps           -> {steps:[...], status} (poll a running run)
 //   GET  /api/projects/{id}/assistant-activity?limit= -> {beating, beats:[{...,activity:[...]}]}
+//   POST /api/projects/{id}/assistants/{aid}/beat {task?} -> {ok,beat_id,status}; 409 = busy
 // Workspace tabs (all GET /api/projects/{id}/...; any of them may 404 until the
 // backend ships them — callers MUST degrade to an empty state, never an error):
 //   /docs · /docs/{name} · /files?path= · /file?path= · /database · /secrets[?reveal=1]
@@ -53,7 +54,12 @@ async function req(method, path, body) {
   try { data = text ? JSON.parse(text) : null; } catch { /* non-JSON */ }
   if (!r.ok) {
     const msg = (data && (data.detail || data.error || data.message)) || ("HTTP " + r.status);
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    // Carry the HTTP status. Not every failure deserves an apology: a 409 from the beat
+    // endpoint means "that assistant is already working", which the UI must say in those
+    // words instead of rendering a generic red error.
+    err.status = r.status;
+    throw err;
   }
   return data;
 }
@@ -161,6 +167,13 @@ const live = {
   // action ∈ start | pause | beat  ("beat" returns as soon as the beat row exists)
   assistantAction:   (id, aid, action) =>
     req("POST", `/api/projects/${encodeURIComponent(id)}/assistants/${aid}/${action}`, {}),
+  // The same beat endpoint, but ADDRESSED: `task` is what the human typed after
+  // "@Name" in the builder composer. An empty task must send an EMPTY body — that is
+  // the plain "Beat now" button's contract, and the server distinguishes the two
+  // (an asked beat is recorded with trigger_kind "ask" and echoes back as user_ask).
+  assistantBeat:     (id, aid, task) =>
+    req("POST", `/api/projects/${encodeURIComponent(id)}/assistants/${aid}/beat`,
+        task ? { task: String(task).slice(0, 4000) } : {}),
   assistantBeats:    (id, aid) => sub(id, `assistants/${aid}/beats`),
   // The project-wide activity feed: what every assistant has actually been DOING,
   // line by line (phases, tool calls, results). Beats oldest-first, and a running

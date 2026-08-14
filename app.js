@@ -56,6 +56,19 @@ const state = {
   // state.messages — compactMessages() PUTs that thread and the server REPLACES it,
   // so anything of the server's parked there gets clobbered on the next save.
   assistantActivity: null,   // { beating, beats:[{beat_id,name,role,status,activity:[…]}] }
+
+  // Who can be addressed with "@" in the composer. Fetched from the SAME endpoint the
+  // Assistants tab uses (and re-seeded from its payload) so the picker and the tab can
+  // never disagree about who exists. Held here rather than read out of
+  // state.tabs.assistants because the composer needs it whether or not that tab was
+  // ever opened. null = not fetched yet · [] = fetched, this app has none.
+  asstRoster: null,
+
+  // The composer is IMPERATIVE (see composer()): its text and its inline error live in
+  // state so a repaint — the activity feed repaints the left pane every few seconds
+  // while a beat runs — rebuilds the box with what the user was typing still in it.
+  composerDraft: "",
+  composerError: "",
 };
 
 // A prompt the user submitted while logged out is stashed here (and in sessionStorage)
@@ -418,6 +431,7 @@ function completeLastLine() {
 
 // ---------- rendering ----------
 function render() {
+  const cap = captureComposerFocus();
   root.innerHTML = "";
   if (state.booting) { root.appendChild(bootScreen()); return; }
   if (!isMock() && !auth.isAuthed()) { root.appendChild(loginScreen()); return; }
@@ -427,6 +441,29 @@ function render() {
   root.appendChild(topbar());
   root.appendChild(el("div", { class: "split" }, leftPanel(), rightPanel()));
   scrollThread();
+  restoreComposerFocus(cap);
+}
+
+// The composer is the one element a rebuild can take away from the user mid-word. Both
+// the pipeline stream and the assistant activity feed repaint while somebody is typing
+// — and typing at an assistant WHILE it narrates is the normal case for @-mentions, not
+// an edge one. The text survives via state.composerDraft; the caret and the open picker
+// have to be carried across by hand.
+function captureComposerFocus(scope) {
+  const ae = document.activeElement;
+  if (!ae || ae.id !== "prompt") return null;
+  if (scope && !scope.contains(ae)) return null;
+  return { caret: ae.selectionStart };
+}
+function restoreComposerFocus(cap) {
+  if (!cap) return;
+  const ta = document.getElementById("prompt");
+  if (!ta) return;
+  ta.focus();
+  ta.setSelectionRange(cap.caret, cap.caret);
+  // With the caret back, re-derive the picker: a narration line arriving must not close
+  // the menu out from under the name being chosen.
+  if (composerRef && composerRef.resync) composerRef.resync();
 }
 
 // ---------- app shell: persistent left rail + main area ----------
@@ -855,13 +892,19 @@ function assistantBeatBubble(b) {
   // Attribution first — WHO did this and whether it finished. Cost only once the beat is
   // over: a running total is not final and would churn the line on every poll.
   const cost = running ? "" : fmtCost(b.cost_usd);
+  // The attribution doubles as "select this assistant": clicking it drops "@Name " into
+  // the composer. There is no hidden selection to get out of sync — the visible @ IS it.
   bubble.appendChild(el("div", { class: "aa-head" },
     beatMark(status),
-    el("strong", { class: "aa-who" }, role && role !== name ? name + " · " + role : name),
+    el("button", { class: "aa-who", type: "button",
+      title: "Message " + name + " — puts @" + name + " in the composer",
+      onclick: () => mentionAssistant(name) },
+      role && role !== name ? name + " · " + role : name),
     el("span", { class: "spacer" }),
     cost ? el("span", { class: "aa-cost" }, cost) : null));
 
-  const trigger = b.trigger_kind === "schedule" ? "scheduled beat" : "manual beat";
+  const trigger = b.trigger_kind === "ask" ? "you asked"
+                : b.trigger_kind === "schedule" ? "scheduled beat" : "manual beat";
   const outcome = running ? "working…" : status === "skipped" ? "nothing to do"
                 : status === "failed" ? "failed" : "finished";
   bubble.appendChild(el("div", { class: "aa-sub" },
@@ -903,32 +946,278 @@ function activityLine(ln) {
     ln.ts ? el("span", { class: "aa-ts" }, String(ln.ts)) : null);
 }
 
+// ---------- addressing an assistant with "@" ----------
+// ONE character decides which half of the product runs. Plain text goes to the strict,
+// ordered build pipeline that produced v1 of the app; "@Name …" hands the same words to
+// that assistant, which has free judgment instead of a script. Getting this wrong in
+// either direction is expensive — a mistyped name must never quietly deploy.
+
+function assistantLabel(a) { return String((a && (a.name || a.role)) || "").trim(); }
+
+// Assistant names are free text and routinely contain SPACES ("Expense management
+// assistant"), so the token after "@" cannot be found by splitting on whitespace: the
+// whole remainder of the line has to be tested against each name. And the candidates
+// must be tried LONGEST FIRST — with both "Dev" and "Developer" on the roster, a
+// first-match parser resolves "@Developer add a search box" to "Dev" and hands it the
+// task "eloper add a search box". Longest-first is the only order that cannot do that.
+function mentionRoster() {
+  return (state.asstRoster || [])
+    .filter((a) => a && assistantLabel(a))
+    .slice()
+    .sort((x, y) => assistantLabel(y).length - assistantLabel(x).length);
+}
+
+// Everything that separates a name from the task that follows it. A name must end at
+// one of these (or at end-of-text), or "@Dev" would match inside "@Devops" too.
+const MENTION_BOUNDARY = /^[\s,.:;!?—-]/;
+
+// Parse a composer line.
+//   null                       -> no "@" at all: this is a pipeline request
+//   {assistant, name, task}    -> addressed to a real assistant
+//   {assistant: null, typed}   -> starts with "@" but nothing matches: send NOTHING
+function parseMention(raw) {
+  const t = String(raw || "").replace(/^\s+/, "");
+  if (!t.startsWith("@")) return null;
+  const after = t.slice(1);
+  const lower = after.toLowerCase();
+  for (const a of mentionRoster()) {
+    const label = assistantLabel(a);
+    if (!lower.startsWith(label.toLowerCase())) continue;
+    const rest = after.slice(label.length);
+    if (rest && !MENTION_BOUNDARY.test(rest)) continue;
+    return { assistant: a, name: label, task: rest.replace(MENTION_BOUNDARY, "").trim() };
+  }
+  return { assistant: null, typed: (after.split(/\s/)[0] || "").trim() };
+}
+
+// Refusing to send is only helpful if it says who DOES exist.
+function unknownMentionMessage(typed) {
+  const who = typed ? '"@' + typed + '"' : "That";
+  const names = mentionRoster().map(assistantLabel).sort((x, y) => x.localeCompare(y));
+  if (!names.length) {
+    return who + " is not an assistant, and this app has none yet — nothing was sent. "
+      + "Start one in the Assistants tab, or drop the @ to run the update pipeline.";
+  }
+  return who + " is not an assistant on this app — nothing was sent. You can address: "
+    + names.map((n) => "@" + n).join(", ") + ".";
+}
+
+// Drop an existing "@Someone " prefix so re-targeting REPLACES rather than stacks.
+function stripMention(text) {
+  const t = String(text || "");
+  const m = parseMention(t);
+  if (m && m.assistant) return m.task;
+  // An unresolved "@word" is still a mention attempt; drop just that word.
+  const bad = t.match(/^\s*@\S*\s*/);
+  return bad ? t.slice(bad[0].length) : t.replace(/^\s+/, "");
+}
+
+// Selecting an assistant from anywhere in the UI IS "put @Name in the composer" — there
+// is deliberately no hidden "current assistant" state that could drift from the text.
+function mentionAssistant(name) {
+  const label = String(name || "").trim();
+  if (!label) return;
+  setComposerText("@" + label + " " + stripMention(state.composerDraft || ""));
+}
+
+// The composer is imperative (see composer()), so everything OUTSIDE it that wants to
+// change the text goes through here: it writes the durable draft AND the live DOM.
+let composerRef = null;   // { setText, refresh, resync } of the composer currently mounted
+// Which picker row is highlighted. MODULE-level, not a composer() local, so that the
+// left pane repainting under an open picker (a narration line lands every 2.5s during a
+// beat) does not silently throw the highlight back to the first row mid-keystroke.
+let mentionSel = 0;
+// Escape means "stop showing me this", and it has to STAY meant: the picker is derived
+// from the text + caret, so without a latch the next repaint (or a stray click in the
+// box) would immediately re-derive it and pop the menu back open. Cleared by the next
+// edit, which is when the user is asking for suggestions again.
+let mentionDismissed = false;
+function setComposerText(text, { focus = true } = {}) {
+  state.composerDraft = String(text || "");
+  state.composerError = "";
+  if (composerRef) composerRef.setText(state.composerDraft, { focus });
+}
+function setComposerError(msg) {
+  state.composerError = String(msg || "");
+  if (composerRef) composerRef.refresh();
+}
+
 // The composer pinned at the bottom of the left.
+// Deliberately IMPERATIVE: the picker, the routing chip and the text are updated in
+// place on every keystroke. Driving them through render() would rebuild the textarea
+// and throw the caret to the end mid-word. state.composerDraft/composerError are the
+// durable copy, re-seeded below, so a repaint from anywhere else is still lossless.
 function composer() {
   const ta = el("textarea", { id: "prompt", class: "chat-input", rows: 1,
-    placeholder: state.project ? "Request a change to this app…" : "Describe the app you want…",
+    placeholder: state.project ? "Ask for a change, or @mention an assistant…"
+                               : "Describe the app you want…",
     disabled: state.generating });
+  ta.value = state.composerDraft || "";
+
+  const note = el("div", { class: "mention-note", hidden: true });
+  const menu = el("div", { class: "mention-menu", hidden: true });
+  let matches = [];
+  let open = false;
+
+  const caretAt = () => (ta.selectionStart == null ? ta.value.length : ta.selectionStart);
+
+  // Index of the "@" that starts the token the caret is sitting in, or -1.
+  function tokenStart() {
+    const upto = ta.value.slice(0, caretAt());
+    const at = upto.lastIndexOf("@");
+    if (at < 0) return -1;
+    // Only at the very start or after whitespace, so an email address mid-sentence
+    // never opens the picker.
+    if (at > 0 && !/\s/.test(upto[at - 1])) return -1;
+    if (upto.indexOf("\n", at) >= 0) return -1;      // a name cannot span lines
+    return at;
+  }
+
+  function closeMenu() { open = false; menu.hidden = true; menu.replaceChildren(); }
+
+  function syncMenu() {
+    const at = state.project && !mentionDismissed ? tokenStart() : -1;
+    if (at < 0) { closeMenu(); return; }
+    // The query is everything from "@" to the caret — names contain spaces, so it must
+    // not stop at the first one. Once the user has typed past a whole name nothing
+    // matches any more and the picker closes itself, which is exactly when it should
+    // get out of the way of the task text.
+    const q = ta.value.slice(at + 1, caretAt()).toLowerCase();
+    matches = mentionRoster().filter((a) => assistantLabel(a).toLowerCase().startsWith(q));
+    if (!matches.length) { closeMenu(); return; }
+    // Longest-first is right for MATCHING and wrong for a list a human reads.
+    matches.sort((x, y) => assistantLabel(x).localeCompare(assistantLabel(y)));
+    if (mentionSel >= matches.length || mentionSel < 0) mentionSel = 0;
+    open = true;
+    menu.hidden = false;
+    menu.replaceChildren(...matches.map(mentionRow));
+  }
+
+  function mentionRow(a, i) {
+    const label = assistantLabel(a);
+    const caps = (a.capabilities || []).map((c) => capMeta(c).label).filter(Boolean);
+    return el("button", { class: "mention-row" + (i === mentionSel ? " on" : ""), type: "button",
+      // mousedown, NOT click: click lands after the textarea has already blurred.
+      onmousedown: (e) => { e.preventDefault(); choose(i); } },
+      el("div", { class: "mention-row-head" },
+        el("span", { class: "mention-name" }, label),
+        a.role && a.role !== label ? el("span", { class: "mention-role" }, a.role) : null),
+      el("div", { class: "mention-caps" },
+        caps.length ? caps.join(" · ") : (a.description || "no capabilities granted")));
+  }
+
+  function choose(i) {
+    const a = matches[i];
+    const at = tokenStart();
+    if (!a || at < 0) return;
+    const insert = "@" + assistantLabel(a) + " ";
+    const next = ta.value.slice(0, at) + insert + ta.value.slice(caretAt());
+    mentionDismissed = false;
+    closeMenu();
+    apply(next, at + insert.length);
+  }
+
+  // Write a new value + caret, keeping the durable draft in step.
+  function apply(value, caret) {
+    ta.value = value;
+    state.composerDraft = value;
+    state.composerError = "";
+    autoGrow(ta);
+    ta.focus();
+    const c = caret == null ? value.length : caret;
+    ta.setSelectionRange(c, c);
+    syncNote();
+  }
+
+  // The chip that makes the routing legible: while an "@Name" prefix resolves, say out
+  // loud that this is going to that assistant and NOT to the build pipeline.
+  function syncNote() {
+    note.replaceChildren();
+    if (state.composerError) {
+      note.appendChild(el("div", { class: "mention-err" }, state.composerError));
+      note.hidden = false;
+      return;
+    }
+    const m = state.project ? parseMention(state.composerDraft || "") : null;
+    if (m && m.assistant) {
+      note.appendChild(el("div", { class: "mention-chip" },
+        el("span", { class: "mc-at" }, "@"),
+        el("span", { class: "mc-name" }, m.name),
+        el("span", { class: "mc-to" }, "gets this — the build pipeline does not run"),
+        el("button", { class: "mc-x", type: "button", title: "Send to the build pipeline instead",
+          onmousedown: (e) => { e.preventDefault(); apply(stripMention(state.composerDraft || "")); } },
+          "✕")));
+      note.hidden = false;
+      return;
+    }
+    note.hidden = true;
+  }
 
   const send = () => {
     const v = ta.value.trim();
     if (!v) return;
-    ta.value = ""; autoGrow(ta);
+    closeMenu();
+    // sendMessage clears the box itself, but ONLY once it has accepted the text — an
+    // unresolved "@name" must leave the words in place so they can be corrected.
     sendMessage(v);
   };
   const sendBtn = el("button", { class: "btn primary chat-send", title: "Send",
     disabled: state.generating, onclick: send },
     state.generating ? el("span", { class: "spin" }) : el("span", { html: "&#8593;" }));
 
-  ta.addEventListener("input", () => autoGrow(ta));
+  ta.addEventListener("input", () => {
+    state.composerDraft = ta.value;
+    state.composerError = "";      // they are already fixing it; stop shouting
+    mentionSel = 0;
+    mentionDismissed = false;
+    autoGrow(ta);
+    syncMenu();
+    syncNote();
+  });
+  // The caret can move to another token without an edit (arrows, a click).
+  ta.addEventListener("keyup", (e) => { if (e.key && e.key.indexOf("Arrow") === 0) syncMenu(); });
+  ta.addEventListener("click", () => syncMenu());
+  ta.addEventListener("blur", () => closeMenu());
   ta.addEventListener("keydown", (e) => {
+    if (open) {
+      if (e.key === "ArrowDown") { e.preventDefault(); mentionSel = (mentionSel + 1) % matches.length; syncMenu(); return; }
+      if (e.key === "ArrowUp")   { e.preventDefault(); mentionSel = (mentionSel - 1 + matches.length) % matches.length; syncMenu(); return; }
+      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); choose(mentionSel); return; }
+      if (e.key === "Escape")    { e.preventDefault(); mentionDismissed = true; closeMenu(); return; }
+    }
+    // Enter only ever sends while the picker is CLOSED — otherwise choosing a name
+    // would fire the message off half-typed.
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
 
-  const hint = state.project
-    ? el("div", { class: "composer-hint" }, "Changes run the update pipeline on this app.")
-    : el("div", { class: "composer-hint" }, "A full build can take a few minutes — steps stream live.");
+  const roster = state.project ? (state.asstRoster || []) : [];
+  const hint = !state.project
+    ? el("div", { class: "composer-hint" }, "A full build can take a few minutes — steps stream live.")
+    : el("div", { class: "composer-hint" }, roster.length
+        ? "Plain text runs the update pipeline. Type @ to hand it to one of this app's "
+          + roster.length + (roster.length === 1 ? " assistant" : " assistants") + " instead."
+        : "Changes run the update pipeline on this app.");
 
-  return el("div", { class: "composer" }, hint,
+  // Whoever mounted last owns the imperative handles.
+  composerRef = {
+    setText: (text, { focus = true } = {}) => {
+      if (!ta.isConnected) return;
+      ta.value = text;
+      autoGrow(ta);
+      if (focus) { ta.focus(); ta.setSelectionRange(text.length, text.length); }
+      closeMenu();
+      syncNote();
+    },
+    refresh: () => { if (ta.isConnected) syncNote(); },
+    // Re-derive the picker + chip from the current text and caret. Used by repaintLeft()
+    // after it carries the caret across a rebuild.
+    resync: () => { if (ta.isConnected) { syncMenu(); syncNote(); } },
+  };
+  syncNote();
+
+  // The menu hangs above the WHOLE composer, not just the input, so it never sits on
+  // top of the hint or the routing chip it is meant to be read alongside.
+  return el("div", { class: "composer" }, menu, hint, note,
     el("div", { class: "composer-row" }, ta, sendBtn));
 }
 
@@ -1045,6 +1334,14 @@ function leftSignature() {
       m: (state.messages || []).map((m) => [m.role, m.text, m.kind, stepSig(m.steps)]),
       r: rh ? [rh.kind, rh.status, rh.request, stepSig(rh.steps)] : null,
       a: aa ? [!!aa.beating, activitySig(aa)] : null,
+      // The roster is rendered — the composer hint counts the assistants you can @ —
+      // so it belongs here or the hint would go stale until something else repainted.
+      // state.composerDraft/composerError are deliberately NOT here: they are the only
+      // pieces of the left pane a repaint never DELIVERS. composer() applies them in
+      // place and re-seeds itself from them on every rebuild, so they can never render
+      // stale; including them would repaint the pane on each keystroke and take the
+      // caret with it — the exact flicker this gate exists to stop.
+      n: (state.asstRoster || []).length,
     });
   } catch { return String(Math.random()); }   // never suppress a paint on an error
 }
@@ -1065,7 +1362,11 @@ function repaintLeft() {
   const wasNearBottom = !sc || (sc.scrollHeight - sc.scrollTop - sc.clientHeight) < 80;
   const prevTop = sc ? sc.scrollTop : 0;
 
+  // The composer goes with the pane (see captureComposerFocus).
+  const cap = captureComposerFocus(old);
+
   old.replaceWith(leftPanel());
+  restoreComposerFocus(cap);
 
   const next = document.querySelector(".split > .left #chat-thread")
     || document.querySelector(".split > .left .chat-thread");
@@ -1213,6 +1514,12 @@ async function loadTab(tab, { force = false } = {}) {
   // Ignore a response that arrived after the user switched projects.
   if (!state.project || state.project.id !== id) return;
   state.tabs[tab] = next;
+  // The composer's @-mention roster is the same payload. Re-seeding it here is what
+  // keeps the picker honest after a start/delete without a second round trip.
+  if (tab === "assistants" && next.data) {
+    state.asstRoster = next.data.assistants || [];
+    repaintLeft();          // the composer hint counts them (and is in leftSignature)
+  }
   if (state.tab === tab) repaintRight();
 }
 
@@ -1815,6 +2122,10 @@ function assistantCard(a) {
           el("span", { class: "asst-last-txt" }, String(last.thought).slice(0, 180)))
       : null,
     el("div", { class: "asst-actions" },
+      // "Beat now" runs it with no instructions; "@ Message" is the other half — it
+      // targets the composer at this assistant so the beat gets an actual task.
+      el("button", { class: "btn sm", title: "Address this assistant in the chat",
+        onclick: () => mentionAssistant(a.name || a.role) }, "@ Message"),
       el("button", { class: "btn sm", disabled: state.asstBusy,
         onclick: () => assistantAct(a.id, "beat") }, "▶ Beat now"),
       el("button", { class: "btn sm", disabled: state.asstBusy,
@@ -1841,6 +2152,8 @@ function assistantDetail() {
   const allCaps = (state.asstCatalog && state.asstCatalog.capabilities) || [];
 
   const head = tabToolbar(back, el("div", { class: "spacer" }),
+    el("button", { class: "btn sm", title: "Address this assistant in the chat",
+      onclick: () => mentionAssistant(a.name || a.role) }, "@ Message"),
     el("button", { class: "btn sm", disabled: state.asstBusy,
       onclick: () => assistantAct(a.id, "beat") }, "▶ Beat now"),
     el("button", { class: "btn sm", disabled: state.asstBusy,
@@ -2332,22 +2645,85 @@ async function loadProjects() {
 // Populate the composer with an example prompt (chips don't auto-send — the user
 // can tweak the wording, then press Send).
 function fillComposer(text) {
-  const ta = document.getElementById("prompt");
-  if (!ta) return;
-  ta.value = text;
-  autoGrow(ta);
-  ta.focus();
-  ta.setSelectionRange(ta.value.length, ta.value.length);
+  setComposerText(text);
 }
 
-// The one entry point for the composer (and example chips). First message with no
-// project -> create; every message after -> request a change (update pipeline).
-function sendMessage(text) {
+// The one entry point for the composer (and example chips). ONE character routes it:
+//   "add a search box"           -> the strict, ordered build pipeline (as ever)
+//   "@Developer add a search box"-> that assistant's own container, as a task
+// The @ form must NOT touch the pipeline, and an @ that resolves to nobody must not be
+// quietly demoted into one — silently deploying "@Devloper add login" is the surprise
+// this whole branch exists to prevent.
+async function sendMessage(text) {
   text = (text || "").trim();
   if (!text || state.generating) return;
-  pushMessage("user", { text });
+
+  // Resolve the roster BEFORE deciding. Sending "@Developer …" a second after the page
+  // loaded must not be answered with "there are no assistants" merely because the
+  // roster fetch is still in the air.
+  if (state.project && /^@/.test(text) && !state.asstRoster) await refreshAssistantRoster();
+
+  // No project means no assistants to address, so "@" there is just prose.
+  const m = state.project ? parseMention(text) : null;
+  if (m && !m.assistant) { setComposerError(unknownMentionMessage(m.typed)); return; }
+
+  setComposerText("", { focus: false });
+  pushMessage("user", { text });          // one thread: the ask reads like any message
+  if (m) { askAssistant(m.assistant, m.task); return; }
   if (state.project) onUpdate(text);
   else onCreate(text);
+}
+
+// Hand the message to ONE assistant instead of the pipeline. The beat runs in that
+// assistant's own container and this call returns as soon as the beat row exists;
+// everything after that arrives through the activity feed. Deliberately does NOT set
+// state.generating — locking the composer for the 30-90s a beat takes would be a lie
+// about what is actually blocked (nothing is; you can keep talking).
+async function askAssistant(a, task) {
+  persistMessages();
+  render();
+  const name = assistantLabel(a);
+  try {
+    await api.assistantBeat(state.project.id, a.id, task);
+  } catch (e) {
+    // 409 is not a failure, it is a fact about timing — say it in those words rather
+    // than as a generic red error, and never swallow it.
+    const busy = e && e.status === 409;
+    pushMessage("assistant", {
+      text: busy
+        ? name + " is already working on something — wait for the current beat to finish, then ask again."
+        : "Could not reach " + name + ". " + ((e && e.message) || "Please try again."),
+      kind: busy ? "" : "error" });
+    persistMessages();
+    render();
+    return;
+  }
+  toast(name + " is on it — watch the left pane.", "ok");
+  // The narration must start arriving now, not on the next idle 15s tick.
+  startActivityPoll();
+}
+
+// ---------- the @-mention roster ----------
+// Same endpoint the Assistants tab reads, so the picker and the tab cannot disagree
+// about who exists. Never throws and never surfaces an error: not knowing the roster
+// only costs the picker, and the composer still routes to the pipeline.
+async function refreshAssistantRoster() {
+  const proj = state.project;
+  if (!proj || !api.assistants) return;
+  // The picker prints each assistant's capabilities, and their HUMAN labels only live in
+  // the catalog — without it the rows read "read_costs · comment". Cached per session.
+  loadAsstCatalog();
+  try {
+    const data = await api.assistants(proj.id);
+    if (!state.project || state.project.id !== proj.id) return;   // switched apps mid-flight
+    state.asstRoster = (data && Array.isArray(data.assistants)) ? data.assistants : [];
+  } catch (e) {
+    if (!state.project || state.project.id !== proj.id) return;
+    // A 404 is a verdict ("this control plane has no assistants endpoint"): stop asking.
+    // Anything else is transient, so leave the roster UNKNOWN and let the next send retry.
+    if (e instanceof NotFoundError || (e && e.name === "NotFoundError")) state.asstRoster = [];
+  }
+  repaintLeft();      // the composer hint counts the roster (and is in leftSignature)
 }
 
 function finalizeLiveMsg(text, kind) {
@@ -2462,8 +2838,9 @@ async function onCreate(prompt) {
     await loadProjects();
     render();
     // The app now EXISTS, so its assistants can start beating — begin watching the feed
-    // without waiting for the user to reload the page.
+    // (and learn who is mentionable) without waiting for the user to reload the page.
     startActivityPoll();
+    refreshAssistantRoster();
     toast("App built.", "ok");
   }).catch((e) => {
     finalizeLiveMsg("Sorry — the build failed. " + (e && e.message ? e.message : "Please try again."), "error");
@@ -2534,6 +2911,10 @@ function resetBuilder() {
   // was a verdict about the LAST project's fetch, so re-test it for the next one.
   state.assistantActivity = null;
   activityMisses = 0; activityAbsent = false;
+  // Same reasoning for who is mentionable, and for what was half-typed at them: both
+  // belong to the app being left, not to the next one.
+  state.asstRoster = null;
+  state.composerDraft = ""; state.composerError = "";
   state.previewNonce = 0;
   state.tab = "site";
   state.openTabs = [];
@@ -2593,6 +2974,9 @@ async function enterProject(id, { navigate = true } = {}) {
   // /builder/<id> shows the same lines a live beat wrote. Fires after the first paint
   // so it can never delay the workspace.
   startActivityPoll();
+  // …and WHO they are, so "@" opens a populated picker on the first keystroke rather
+  // than after a round trip the user has to wait through.
+  refreshAssistantRoster();
 }
 
 // Second source for the executed steps: GET /api/projects/{id}/steps. Runs after

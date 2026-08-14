@@ -6,6 +6,12 @@
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const rid = () => (Math.random().toString(36) + "000000").slice(2, 8);
 
+// A call log for headless UI tests. WHICH endpoint a composer message reached is the
+// whole point of @-mention routing ("@Developer …" must never touch the update
+// pipeline), and that is only observable from outside if the mock records it.
+globalThis.__BUILDERAPPS_MOCK_CALLS = [];
+const record = (fn, args) => { globalThis.__BUILDERAPPS_MOCK_CALLS.push({ fn, args }); };
+
 // The ordered pipeline steps a real create run streams (a representative subset).
 const PIPELINE_STEPS = [
   "Allocate shortid + subdomain",
@@ -371,6 +377,7 @@ export const mockApi = {
   },
 
   async updateProjectStream(id, request, onEvent) {
+    record("updateProjectStream", { id, request });
     const p = store.get(id);
     if (!p) { const e = new Error("not found"); e.name = "NotFoundError"; throw e; }
     const steps = ["Checkout latest", "Plan a minimal diff", "Apply the change",
@@ -409,7 +416,14 @@ export const mockApi = {
           capabilities: ["read_repo", "comment"], interval_minutes: 60, soul_md: "# Who I am\nEngineer." },
       ] };
   },
-  async assistants() { await wait(120); return { assistants: [] }; },
+  // A REAL roster, because the composer's @-mention picker is driven by it and an empty
+  // list makes the whole feature untestable offline. Deliberately shaped to exercise the
+  // two matching hazards: a name with SPACES, and two names sharing a prefix
+  // ("Dev" vs "Developer") where only longest-match gives the right answer.
+  async assistants() {
+    await wait(120);
+    return { assistants: MOCK_ASSISTANTS.map((a) => ({ ...a })) };
+  },
   async createAssistant(id, body) {
     await wait(200);
     return { id: 1, project_id: id, role: body.role || "Assistant", name: body.name || "Assistant",
@@ -421,6 +435,22 @@ export const mockApi = {
   async deleteAssistant() { await wait(150); return { ok: true }; },
   async assistantAction() { await wait(150); return { ok: true, status: "running" }; },
   async assistantBeats() { await wait(120); return { beats: [] }; },
+
+  // An ADDRESSED beat ("@Developer add a search box"). Beating the same assistant twice
+  // without letting the first finish reproduces the live 409, so the "already working"
+  // path is reachable in ?mock=1 rather than only in production.
+  async assistantBeat(id, aid, task) {
+    record("assistantBeat", { id, aid, task: task || "" });
+    await wait(150);
+    if (mockBeating.has(aid)) {
+      const e = new Error("This assistant already has a beat in flight.");
+      e.status = 409;
+      throw e;
+    }
+    mockBeating.add(aid);
+    setTimeout(() => mockBeating.delete(aid), 20000);
+    return { ok: true, beat_id: 900 + aid, status: "running" };
+  },
 
   // The left-pane activity feed. The running beat REVEALS ONE MORE LINE per poll so
   // ?mock=1 exercises the real thing the live feed does — an array that only grows —
@@ -469,3 +499,27 @@ const MOCK_RUNNING_ACTIVITY = [
   { kind: "result", icon: "🔴", text: "health gate FAILED — rolled back to the last good commit", ok: false,
     detail: "GET / returned 500: SessionStore is not a constructor", ts: "16:14:02" },
 ];
+
+// The assistants GET .../assistants returns in ?mock=1. "Dev" exists ALONGSIDE
+// "Developer" on purpose: a naive first-match parser resolves "@Developer add a search
+// box" to "Dev" and hands the assistant the task "eloper add a search box".
+const MOCK_ASSISTANTS = [
+  { id: 1, role: "Product Owner", name: "Product Owner", status: "active",
+    description: "Reads the goals, judges the gap, proposes the next thing.",
+    capabilities: ["read_repo", "comment", "read_costs"], interval_minutes: 120,
+    last_beat_at: new Date(Date.now() - 26 * 60e3).toISOString() },
+  { id: 2, role: "Developer", name: "Developer", status: "active",
+    description: "Reads the code, spots rot, ships the fix.",
+    capabilities: ["read_repo", "edit_code", "commit_push"], interval_minutes: 60,
+    last_beat_at: new Date(Date.now() - 3 * 60e3).toISOString() },
+  { id: 3, role: "Developer", name: "Dev", status: "paused",
+    description: "A second pair of hands, currently paused.",
+    capabilities: ["read_repo"], interval_minutes: 240, last_beat_at: null },
+  { id: 4, role: "Finance", name: "Expense management assistant", status: "active",
+    description: "Watches spend and files the receipts.",
+    capabilities: ["read_costs", "comment"], interval_minutes: 720,
+    last_beat_at: new Date(Date.now() - 90 * 60e3).toISOString() },
+];
+
+// Assistants with a beat in flight — a second beat on one of these 409s, like the API.
+const mockBeating = new Set();
