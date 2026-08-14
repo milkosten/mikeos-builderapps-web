@@ -914,14 +914,17 @@ function repaintLeft() {
   _leftSig = sig;
 
   // Preserve the reader's place: only auto-scroll if they were already at the bottom.
-  const sc = old.querySelector(".thread") || old.querySelector(".scroll");
+  // The scroller is `.chat-thread` (id `chat-thread`) — the earlier `.thread`/`.scroll`
+  // selectors matched NOTHING, so `sc` was always null, `wasNearBottom` always true, and
+  // every repaint still yanked the reader to the bottom. Use the real element.
+  const sc = old.querySelector("#chat-thread") || old.querySelector(".chat-thread");
   const wasNearBottom = !sc || (sc.scrollHeight - sc.scrollTop - sc.clientHeight) < 80;
   const prevTop = sc ? sc.scrollTop : 0;
 
   old.replaceWith(leftPanel());
 
-  const next = document.querySelector(".split > .left .thread")
-    || document.querySelector(".split > .left .scroll");
+  const next = document.querySelector(".split > .left #chat-thread")
+    || document.querySelector(".split > .left .chat-thread");
   if (next) {
     if (wasNearBottom) scrollThread();
     else next.scrollTop = prevTop;            // reading history? stay put
@@ -1393,7 +1396,11 @@ function logsTab() {
 // is flagged as estimated only when the provider didn't return one.
 function usageTab() {
   const d = state.tabs.usage && state.tabs.usage.data;
-  if (!d || !d.totals) return tabEmpty("No LLM usage recorded yet — it appears as the build runs.");
+  // `totals` is always present (SUM over zero rows), so an all-zero project must be detected
+  // by the call count — otherwise it renders "$0.0000 · billed by provider", which reads as
+  // "this build was free" rather than "nothing recorded yet".
+  if (!d || !d.totals || !Number(d.totals.calls))
+    return tabEmpty("No LLM usage recorded yet — it appears as the build runs.");
   const t = d.totals;
   const n = (x) => Number(x || 0).toLocaleString();
   const usd = (x) => "$" + Number(x || 0).toFixed(4);
