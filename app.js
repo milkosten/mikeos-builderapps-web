@@ -2105,13 +2105,18 @@ function startBeatPoll(aid) {
     ticks++;
     if (ticks > 60 || state.tab !== "assistants") { stopBeatPoll(); return; }
     try {
-      if (state.asstSel === aid) await loadAssistantDetail(aid, true);
-      else await loadTab("assistants", { force: true });
-      const beats = state.asstSel === aid
-        ? ((state.asstDetail && state.asstDetail.data && state.asstDetail.data.beats) || [])
-        : [];
-      if (state.asstSel === aid && beats.length && beats[0].status !== "running") {
-        stopBeatPoll();
+      if (state.asstSel === aid) {
+        await loadAssistantDetail(aid, true);
+        const beats = (state.asstDetail && state.asstDetail.data && state.asstDetail.data.beats) || [];
+        if (beats.length && beats[0].status !== "running") stopBeatPoll();
+      } else {
+        await loadTab("assistants", { force: true });
+        // From the card grid there is no beat list to watch, so watch the assistant's own
+        // `beating` flag instead — otherwise the poll would run out its whole budget after
+        // the beat had already finished.
+        const t = state.tabs.assistants;
+        const row = ((t && t.data && t.data.assistants) || []).find((x) => x.id === aid);
+        if (row && !row.beating) stopBeatPoll();
       }
     } catch { /* a transient poll failure must never break the tab */ }
   }, 4000);
