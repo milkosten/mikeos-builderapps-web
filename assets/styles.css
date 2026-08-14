@@ -1493,7 +1493,7 @@ button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 
 }
 
 /* ----- the room's shell ----- */
-.discuss-split { grid-template-columns: 1fr 340px; }
+.discuss-split { grid-template-columns: 1fr minmax(280px, 340px); }
 .left.discuss { border-right: 1px solid var(--border); background: var(--bg); }
 /* The centred column. Applied to the SCROLLER itself so the scrollbar sits at the panel edge
    where a reader expects it, not inside the text column. */
@@ -1693,11 +1693,20 @@ button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 
 .draft-x:hover { color: var(--danger); }
 
 /* ----- narrow screens: the canvas moves under the thread ----- */
-@media (max-width: 900px) {
+/* The canvas stacks under the thread only on a genuinely small screen. The breakpoint is
+   deliberately low (a phone, not a small laptop): the canvas beside the conversation IS the
+   feature — "the plan is visible and takes shape, rather than being buried in scrollback" —
+   and hiding it at 900px would have turned every 13" laptop into the version without it. */
+@media (max-width: 680px) {
   .discuss-split, .discuss-split:has(.canvas-collapsed) { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
   .right.canvas { max-height: 40vh; border-left: 0; border-top: 1px solid var(--border); }
   .right.canvas-collapsed, .right.canvas-empty { display: none; }
   .discuss-title-text { max-width: 140px; }
+}
+/* Between the two the thread gives up its side padding before it gives up the canvas. */
+@media (max-width: 1080px) {
+  .left.discuss .chat-thread { padding: 20px 14px 10px; }
+  .discuss-title-text { max-width: 180px; }
 }
 
 /* ----- icons, drawn rather than typed ----------------------------------- */
