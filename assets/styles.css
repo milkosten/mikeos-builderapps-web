@@ -882,7 +882,9 @@ a.btn { text-decoration: none; }
 .hydrating { display: flex; align-items: center; gap: 10px; color: var(--text-dim); font-size: 13px; }
 
 @media (max-width: 900px) {
-  .split-pane { grid-template-columns: 1fr; grid-template-rows: 170px 1fr; }
+  /* Stacked: the list must never eat the document pane on a short viewport —
+     a proportional row keeps the rendered doc / file readable. */
+  .split-pane { grid-template-columns: 1fr; grid-template-rows: minmax(84px, 30%) 1fr; }
   .doc-list { border-right: 0; border-bottom: 1px solid var(--border); }
   .kv-key { flex-basis: 130px; }
 }
