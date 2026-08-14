@@ -28,9 +28,16 @@
 	}
 
 	# All client-side routes fall back to the SPA shell. These are real pushState
-	# paths the app owns: /, /auth/callback, /builder, /apps, /settings, /profile,
-	# /subscription (and any future ones). A catch-all -> index.html is correct
-	# because generated project apps live on *.builderapps.osmike.com, not here.
+	# paths the app owns: /, /auth/callback, /builder, /builder/<id>, /discuss and
+	# /discuss/<id> (phase 34 — the pre-build discussion room, resumable AND
+	# shareable, so a hard reload on one MUST reach index.html), /apps, /settings,
+	# /profile, /subscription. A catch-all -> index.html is correct because
+	# generated project apps live on *.builderapps.osmike.com, not here — which is
+	# also why a new SPA route needs no change to this file, only to this comment.
+	#
+	# This file is OURS. The SHARED Caddyfile (/opt/mikephotos/deploy/Caddyfile,
+	# ~60 vhosts) is not, and nothing here ever needs to touch it: it only proxies
+	# builderapps.osmike.com to this container.
 	handle {
 		rewrite * /index.html
 		file_server

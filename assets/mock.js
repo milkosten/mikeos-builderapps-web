@@ -340,8 +340,107 @@ const MOCK_WS_EVENTS = {
           note: "Empty list renders no message at all", ts: _iso(45) }],
 };
 
+// ---- phase 34: the discussion room ----------------------------------------
+// Enough of a stand-in to drive the room offline: an opening draft with real chips, a canvas
+// that moves as answers land, and "show me the vision" rendering inline. It is a SCRIPT, not
+// a model — its only job is to let the UI (scroll policy, chips, canvas, persistence, Build
+// it) be exercised with no backend.
+const discussions = new Map();
+let discussSeq = 0;
+
+function mockCell(v, agreed = false) {
+  return { value: v, agreed, source: agreed ? "decision" : "draft" };
+}
+
 export const mockApi = {
   async health() { return { status: "ok", database: "ok" }; },
+
+  async startDiscussion(seed) {
+    await wait(700);
+    const id = "d" + (++discussSeq) + "mock";
+    const disc = {
+      id, seed, title: seed.slice(0, 60), status: "open", cost_usd: 0.004, turns: 1,
+      canvas: {
+        name: mockCell("Shelfie"),
+        vision: mockCell("A quiet place for a small group to agree on what to read next and "
+                         + "keep track of what they finished."),
+        audience: mockCell("small in-person groups"),
+        features: mockCell(["a shared shelf", "vote on the next book", "meeting notes"]),
+        stack: mockCell("one account per group, data owned by the group"),
+        out_of_scope: mockCell(["reading ebooks in the app"]),
+        changelog: [],
+      },
+      messages: [
+        { role: "user", text: seed },
+        { role: "assistant",
+          text: "Here's what I think you're building.\n\n**Shelfie** — a shared shelf for a "
+              + "small group: everyone adds books, the group votes on what's next, and each "
+              + "meeting gets a short note. I'd leave actual ebook reading out entirely.\n\n"
+              + "Three things I need from you:",
+          questions: [
+            { q: "Who is this for?", options: ["just me", "a team", "the public"],
+              recommended: "a team", why: "It decides whether accounts and sharing exist at all." },
+            { q: "Where does the scope stop?",
+              options: ["books only", "books + meetings", "books + meetings + reviews"],
+              recommended: "books + meetings", why: "It sets the size of the first backlog." },
+            { q: "Who owns the data?", options: ["each group", "one admin", "public read"],
+              recommended: "each group", why: "It decides the auth model and the schema." },
+          ] },
+      ],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    };
+    discussions.set(id, disc);
+    return JSON.parse(JSON.stringify(disc));
+  },
+
+  async listDiscussions() {
+    await wait(80);
+    return [...discussions.values()].map((d) => ({
+      id: d.id, title: d.title, seed: d.seed, status: d.status, cost_usd: d.cost_usd,
+      message_count: d.messages.length, created_at: d.created_at, updated_at: d.updated_at }));
+  },
+
+  async getDiscussion(id) {
+    await wait(120);
+    const d = discussions.get(id);
+    if (!d) { const e = new Error("not found"); e.name = "NotFoundError"; throw e; }
+    return JSON.parse(JSON.stringify(d));
+  },
+
+  async sayDiscussion(id, text) {
+    await wait(900);
+    const d = discussions.get(id);
+    if (!d) { const e = new Error("not found"); e.name = "NotFoundError"; throw e; }
+    d.messages.push({ role: "user", text });
+    const reply = { role: "assistant" };
+    if (/show|see|read|what/i.test(text) && /vision|plan|brief/i.test(text)) {
+      reply.text = "Here it is as it stands:";
+      reply.show = "vision";
+      reply.shown = "## Shelfie\n\n" + d.canvas.vision.value
+                  + "\n\n**Who it's for:** " + d.canvas.audience.value;
+    } else {
+      d.canvas.audience = mockCell(text.slice(0, 80), true);
+      reply.text = "Got it — noted on the canvas. Anything you'd deliberately leave out?";
+      reply.questions = [{ q: "Anything to rule out?", options: ["nothing yet", "no mobile app"],
+                           recommended: "nothing yet", why: "Non-goals keep the backlog honest." }];
+    }
+    d.messages.push(reply);
+    d.cost_usd = Number((d.cost_usd + 0.003).toFixed(4));
+    d.turns += 1;
+    d.updated_at = new Date().toISOString();
+    return JSON.parse(JSON.stringify(d));
+  },
+
+  async discussionBrief(id) {
+    await wait(120);
+    const d = discussions.get(id);
+    if (!d) { const e = new Error("not found"); e.name = "NotFoundError"; throw e; }
+    return { id, title: d.canvas.name.value,
+             brief: "Shelfie: " + d.canvas.vision.value + "\n\nWho it is for: "
+                    + d.canvas.audience.value };
+  },
+
+  async deleteDiscussion(id) { discussions.delete(id); return { ok: true, deleted: id }; },
 
   async listProjects() {
     await wait(120);

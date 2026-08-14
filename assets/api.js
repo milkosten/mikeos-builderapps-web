@@ -3,7 +3,7 @@
 //
 // Contract (dual-auth JWT/X-API-KEY; we send the OAuth Bearer):
 //   GET  /api/health                       -> {status, database}
-//   POST /api/projects {prompt, title?}     -> SSE stream (create pipeline)
+//   POST /api/projects {prompt, title?, discussion_id?} -> SSE stream (create pipeline)
 //   GET  /api/projects                      -> {projects:[...]}
 //   GET  /api/projects/{id}                 -> project row + latest_run(+steps) + messages + url
 //   POST /api/projects/{id}/update {request}-> SSE stream (update pipeline; may 404)
@@ -124,6 +124,24 @@ const live = {
   // Update pipeline — same event shape; may 404 if not deployed yet (caller handles it).
   updateProjectStream: (id, request, onEvent) =>
     sseRequest("POST", `/api/projects/${encodeURIComponent(id)}/update`, { request }, onEvent),
+
+  // --- the pre-build DISCUSSION room (phase 34) ---
+  // A discussion is not a project and has its own URL space: no id here is ever a project
+  // shortid (the server mints `d`+6), so a draft can never be mistaken for an app.
+  // `startDiscussion` TAKES THE FIRST TURN server-side before it answers — the reply already
+  // contains the model's draft proposal and its questions — so it is slow (~10-25s) by
+  // design and the caller must show a thinking state rather than a spinner-free freeze.
+  startDiscussion:  (seed)       => req("POST", "/api/discussions", { seed }),
+  listDiscussions:  ()           => req("GET",  "/api/discussions")
+                                      .then((r) => (r && r.discussions) || []),
+  getDiscussion:    (id)         => req("GET",  `/api/discussions/${encodeURIComponent(id)}`),
+  // Chips and typed text go through the SAME endpoint: what was decided must read the same
+  // in the thread whether it was clicked or written.
+  sayDiscussion:    (id, text)   =>
+    req("POST", `/api/discussions/${encodeURIComponent(id)}/messages`, { text }),
+  // The exact text Build it will send to the pipeline — inspectable BEFORE the build.
+  discussionBrief:  (id)         => req("GET", `/api/discussions/${encodeURIComponent(id)}/brief`),
+  deleteDiscussion: (id)         => req("DELETE", `/api/discussions/${encodeURIComponent(id)}`),
 
   // --- durable chat thread (server-side source of truth) ---
   putMessages:   (id, messages) =>

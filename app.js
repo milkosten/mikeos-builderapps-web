@@ -9,7 +9,7 @@ const root = document.getElementById("root");
 
 // ---------- app state ----------
 const state = {
-  view: "entry",      // entry|apps|settings|profile|subscription (the "/" shell) | builder
+  view: "entry",      // entry|apps|settings|profile|subscription (the "/" shell) | builder | discuss
   projects: [],
   project: null,      // full current project { id,title,status,subdomain,url,pipeline,latest_run }
   generating: false,
@@ -28,6 +28,19 @@ const state = {
   entryDraft: "",     // the entry-screen textarea text (preserved across renders)
   profile: null,      // userinfo from account.osmike.com (best-effort)
   settings: loadSettings(),
+
+  // ----- the pre-build DISCUSSION room (phase 34) -----
+  // A discussion is a conversation that produces a BRIEF. It has no project, no preview and
+  // no pipeline, so it keeps its OWN state rather than borrowing the builder's: mixing them
+  // is how "start a new app" once appended to the previous app's thread.
+  discussion: null,       // the whole server row { id, seed, title, messages, canvas, cost_usd }
+  discussions: [],        // the user's drafts, for the Apps list
+  discussHydrating: false,// loading /discuss/<id> from the server
+  discussThinking: false, // a turn is in flight — the composer is locked and a bubble pulses
+  discussDraft: "",       // composer text, preserved across repaints (same contract as builder)
+  discussError: "",
+  canvasOpen: true,       // the right-hand project canvas (collapsible)
+  discussBuilding: false, // Build it was pressed; the brief is being composed server-side
 
   // ----- builder workspace tabs (right panel) -----
   tab: "site",        // active tab id
@@ -124,19 +137,25 @@ function applyTheme() {
 
 // ---------- routing (real pushState paths) ----------
 const PATH_VIEW = { "/": "entry", "/apps": "apps", "/settings": "settings",
-                    "/profile": "profile", "/subscription": "subscription", "/builder": "builder" };
+                    "/profile": "profile", "/subscription": "subscription",
+                    "/builder": "builder", "/discuss": "discuss" };
 const VIEW_PATH = { entry: "/", apps: "/apps", settings: "/settings",
-                    profile: "/profile", subscription: "/subscription", builder: "/builder" };
-// The "/" family (shell with the left rail). "builder" is the standalone workspace.
+                    profile: "/profile", subscription: "/subscription",
+                    builder: "/builder", discuss: "/discuss" };
+// The "/" family (shell with the left rail). "builder" and "discuss" are standalone rooms.
 const SHELL_VIEWS = new Set(["entry", "apps", "settings", "profile", "subscription"]);
 
 // The builder path CARRIES THE PROJECT ID — "/builder/<id>" — so a reload (or a
 // shared link) can rebuild the whole workspace from the server. Bare "/builder"
 // stays valid and renders the empty state.
 const BUILDER_RE = /^\/builder(?:\/([A-Za-z0-9._-]{1,64}))?\/?$/;
+// Same contract for the discussion room: "/discuss/<id>" is resumable AND shareable, and a
+// discussion that a closed tab could destroy would not be worth having.
+const DISCUSS_RE = /^\/discuss(?:\/([A-Za-z0-9._-]{1,64}))?\/?$/;
 
 function pathFor(view, id) {
   if (view === "builder") return id ? "/builder/" + encodeURIComponent(id) : "/builder";
+  if (view === "discuss") return id ? "/discuss/" + encodeURIComponent(id) : "/discuss";
   return VIEW_PATH[view] || "/";
 }
 
@@ -150,6 +169,7 @@ function navigate(view, { replace = false, id = undefined } = {}) {
   ensureActivityPoll();   // leaving the builder kills the feed's tick chain; coming back re-arms it
 }
 function goBuilder(replace, id) { navigate("builder", { replace: !!replace, id }); }
+function goDiscuss(replace, id) { navigate("discuss", { replace: !!replace, id: id || null }); }
 function goEntry(replace)   { navigate("entry",   { replace: !!replace, id: null }); }
 
 // Once a create stream hands us the real id, rewrite the URL in place so a reload
@@ -159,12 +179,23 @@ function stampBuilderUrl(id) {
   const path = pathFor("builder", id);
   if (location.pathname !== path) history.replaceState(null, "", path);
 }
+// The same trick for a discussion: the room is entered on `/discuss` while the opening turn
+// is still being written, and the id only exists once the server answers. replaceState (not
+// push) so Back goes to the start page rather than to a room that never had an id.
+function stampDiscussUrl(id) {
+  if (!id) return;
+  const path = pathFor("discuss", id);
+  if (location.pathname !== path) history.replaceState(null, "", path);
+}
 
 // Sync the view to the current URL (back/forward, refresh, deep link).
-// Returns the project id when the URL is /builder/<id>, else null.
+// Returns the id carried by the path (project for /builder/<id>, discussion for
+// /discuss/<id>) — `state.view` says which of the two it is.
 function syncViewFromPath() {
   const m = BUILDER_RE.exec(location.pathname);
   if (m) { state.view = "builder"; return m[1] ? decodeURIComponent(m[1]) : null; }
+  const d = DISCUSS_RE.exec(location.pathname);
+  if (d) { state.view = "discuss"; return d[1] ? decodeURIComponent(d[1]) : null; }
   state.view = PATH_VIEW[location.pathname] || "entry";
   return null;
 }
@@ -177,6 +208,14 @@ window.addEventListener("popstate", () => {
     return;
   }
   if (state.view === "builder" && !id) resetBuilder();
+  if (state.view === "discuss") {
+    if (id && (!state.discussion || state.discussion.id !== id)) {
+      render();
+      enterDiscussion(id, { navigate: false });
+      return;
+    }
+    if (!id) resetDiscussion();
+  }
   render();
   ensureActivityPoll();   // back/forward onto the SAME project: nothing re-hydrates, so re-arm here
 });
@@ -476,6 +515,16 @@ function render() {
   if (!isMock() && !auth.isAuthed()) { root.appendChild(loginScreen()); return; }
   // The "/" family renders the app-shell (persistent left rail + a main view).
   if (SHELL_VIEWS.has(state.view)) { root.appendChild(shell()); return; }
+  // "/discuss" is the standalone discussion room: thread + project canvas.
+  if (state.view === "discuss") {
+    root.appendChild(discussTopbar());
+    // The proportions are the other way round from the builder: here the CONVERSATION is the
+    // work and the canvas is the margin note, so the thread gets the room.
+    root.appendChild(el("div", { class: "split discuss-split" }, discussPanel(), canvasPanel()));
+    scrollThread();
+    restoreComposerFocus(cap);
+    return;
+  }
   // "/builder" is the standalone builder workspace.
   root.appendChild(topbar());
   root.appendChild(el("div", { class: "split" }, leftPanel(), rightPanel()));
@@ -566,11 +615,23 @@ function entryView() {
     state.entryDraft = "";
     startBuild(v);
   };
+  // THE SECOND DOOR (phase 34). Same sentence, two destinations: straight into the pipeline,
+  // or into a room where it becomes a brief first. Both read from the same textarea, so an
+  // example chip followed by either button does the obvious thing.
+  const discuss = () => {
+    const v = ta.value.trim();
+    if (!v) return;
+    state.entryDraft = "";
+    startDiscussion(v);
+  };
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
   });
 
-  const sendBtn = el("button", { class: "btn primary entry-send", title: "Build it", onclick: submit },
+  const discussBtn = el("button", { class: "btn entry-discuss", onclick: discuss,
+    title: "Talk it through first — the AI drafts the plan and asks what it needs to know" },
+    el("span", { html: "&#128172;", style: "margin-right:6px" }), el("span", {}, "Discuss"));
+  const sendBtn = el("button", { class: "btn primary entry-send", title: "Build it now", onclick: submit },
     el("span", {}, "Build it"), el("span", { html: "&#8594;", style: "margin-left:2px" }));
 
   const chips = el("div", { class: "entry-examples" });
@@ -583,7 +644,11 @@ function entryView() {
   return el("div", { class: "entry-card" },
     el("h1", { class: "entry-hero" }, "What do you want to build today?"),
     el("p", { class: "entry-sub" }, "Describe an app and watch it get built, deployed, and live — a real Node + Postgres + Redis app on its own URL."),
-    el("div", { class: "entry-composer" }, ta, el("div", { class: "entry-actions" }, sendBtn)),
+    el("div", { class: "entry-composer" }, ta,
+      el("div", { class: "entry-actions" }, discussBtn, sendBtn)),
+    el("p", { class: "entry-hint" },
+      "Build it goes straight to the pipeline. Discuss talks it through first — you'll get a "
+      + "draft plan and a few questions, and you can build at any point."),
     chips);
 }
 
@@ -593,7 +658,7 @@ function appsView() {
     el("h1", {}, "Your apps"),
     el("button", { class: "btn sm", onclick: () => newProject() }, "＋ Build a new app"));
   const list = el("div", { class: "app-list" });
-  if (!state.projects.length) {
+  if (!state.projects.length && !draftList().length) {
     list.appendChild(el("div", { class: "empty" }, "No apps yet — build your first one."));
   } else {
     for (const p of state.projects) {
@@ -616,7 +681,56 @@ function appsView() {
           el("span", { class: "app-card-when" }, fmtDate(p.updated_at || p.created_at)))));
     }
   }
-  return el("div", {}, head, list);
+  return el("div", {}, head, draftSection(), list);
+}
+
+// Discussions that have not been built yet. A DRAFT IS NOT AN APP — no URL, no status pill,
+// nothing to open in the builder — so it gets its own block above the apps and a visibly
+// different card. Rendering it in the same list with a "draft" badge was the tempting version
+// and the wrong one: every link on an app card (open the live site, open the builder) is a
+// link a discussion does not have.
+function draftList() {
+  return (state.discussions || []).filter((d) => d.status !== "built");
+}
+
+function draftSection() {
+  const drafts = draftList();
+  if (!drafts.length) return null;
+  const box = el("div", { class: "draft-list" });
+  for (const d of drafts) {
+    const turns = Number(d.message_count || 0);
+    box.appendChild(el("div", { class: "draft-card", role: "button",
+      title: "Continue this discussion",
+      onclick: () => { goDiscuss(false, d.id); enterDiscussion(d.id, { navigate: false }); } },
+      el("div", { class: "draft-card-main" },
+        el("div", { class: "draft-card-title" },
+          el("span", { class: "draft-ico", html: "&#128172;" }),
+          el("span", {}, d.title || d.seed || d.id)),
+        el("div", { class: "draft-card-sub" }, d.seed || "")),
+      el("div", { class: "app-card-side" },
+        el("span", { class: "badge-draft" }, "Draft · not built"),
+        el("span", { class: "app-card-when" },
+          (turns ? turns + " message" + (turns === 1 ? "" : "s") + " · " : "")
+          + fmtDate(d.updated_at || d.created_at)),
+        el("button", { class: "draft-x", title: "Delete this discussion",
+          onclick: (e) => { e.stopPropagation(); deleteDraft(d); } }, "✕"))));
+  }
+  return el("div", { class: "draft-block" },
+    el("div", { class: "draft-head" }, "Discussions in progress",
+      el("span", { class: "draft-head-note" }, "not built yet")),
+    box);
+}
+
+async function deleteDraft(d) {
+  if (!confirm("Delete this discussion? The conversation and its canvas are lost.")) return;
+  try {
+    await api.deleteDiscussion(d.id);
+    state.discussions = (state.discussions || []).filter((x) => x.id !== d.id);
+    render();
+    toast("Discussion deleted.", "ok");
+  } catch (e) {
+    toast((e && e.message) || "Could not delete that discussion.", "err");
+  }
 }
 
 // "3 new" — beats finished and messages sent since this user last opened the project.
@@ -745,6 +859,531 @@ function startBuild(prompt) {
   goBuilder();               // real /builder path, pushState
   pushMessage("user", { text: prompt });
   onCreate(prompt);
+}
+
+// ===========================================================================
+// THE DISCUSSION ROOM (phase 34)
+//
+// A ChatGPT-shaped room whose OUTPUT IS A BRIEF, not an app. The pipeline behind Build it is
+// unchanged; what changes is what it is told. One sentence used to become a whole product
+// specification by inference — brand, audience, scope — and the inferences were sometimes
+// absurd (a book-club tracker named after the buyer persona the model had just invented).
+//
+// Three rules run through everything below:
+//   1. BUILD IT IS NEVER GATED. It sits in the header, enabled at every depth of the
+//      conversation, including while the model is still writing. Someone who has seen enough
+//      after one turn is not wrong, and a "finish the questions first" gate would make this
+//      screen an obstacle instead of an offer.
+//   2. CHIPS ARE A SHORTCUT, NEVER A CAGE. Clicking an option posts it as the user's own
+//      message through the same endpoint as typing, so the thread records what was decided in
+//      the same words either way — and the composer is always there for "none of these".
+//   3. THE SERVER IS THE SOURCE OF TRUTH. Every turn returns the whole discussion and we
+//      adopt it wholesale. A reload rebuilds the identical room from the identical payload,
+//      so the live view and the after-a-refresh view cannot drift apart.
+// ===========================================================================
+
+// A sentence submitted to Discuss while logged out, resumed after the OAuth round-trip —
+// the same courtesy Build it already had, in its own key so the two can never be confused.
+const PENDING_DISCUSS_KEY = "builderapps_pending_discussion";
+
+function startDiscussion(seed) {
+  seed = (seed || "").trim();
+  if (!seed) return;
+  if (!isMock() && !auth.isAuthed()) {
+    try { sessionStorage.setItem(PENDING_DISCUSS_KEY, seed); } catch {}
+    auth.login();
+    return;
+  }
+  resetDiscussion();
+  goDiscuss(false, null);        // /discuss — the id only exists once the server answers
+  openTurn(seed);
+}
+
+// The opening exchange. The user's sentence is shown IMMEDIATELY as their own message and the
+// room starts thinking — the round trip includes a full model turn (~10-25s), and a blank
+// screen for that long reads as a broken page rather than as thought.
+async function openTurn(seed) {
+  state.discussion = { id: null, seed, title: seed.slice(0, 60), canvas: {},
+                       messages: [{ role: "user", text: seed }] };
+  state.discussThinking = true;
+  render();
+  pinThreadToBottom();
+  try {
+    const disc = await api.startDiscussion(seed);
+    state.discussion = disc;
+    state.discussThinking = false;
+    stampDiscussUrl(disc.id);    // a reload from here rehydrates instead of losing the room
+    repaintDiscuss("send");      // the reply is the answer to something the user just did
+    loadDiscussions();           // it is a draft in Apps from its first turn
+  } catch (e) {
+    state.discussThinking = false;
+    if (e instanceof AuthError) {
+      toast("Session expired — signing you back in…");
+      try { sessionStorage.setItem(PENDING_DISCUSS_KEY, seed); } catch {}
+      auth.clear(); setTimeout(() => auth.login(), 600);
+      return;
+    }
+    state.discussError = (e && e.message) || "Could not start the discussion.";
+    render();
+  }
+}
+
+function resetDiscussion() {
+  state.discussion = null;
+  state.discussHydrating = false;
+  state.discussThinking = false;
+  state.discussBuilding = false;
+  state.discussDraft = "";
+  state.discussError = "";
+  _discussSig = null;
+}
+
+// /discuss/<id>: rebuild the WHOLE room from the server — thread, questions, sources and
+// canvas. Exactly the treatment /builder/<id> gets, for exactly the same reason.
+async function enterDiscussion(id, { navigate = true } = {}) {
+  if (!id) return;
+  resetDiscussion();
+  state.discussHydrating = true;
+  state.view = "discuss";
+  if (navigate) goDiscuss(false, id); else render();
+  try {
+    const disc = await api.getDiscussion(id);
+    state.discussion = disc;
+    state.discussHydrating = false;
+    render();
+    // CASE 1 of the scroll policy: opening a room lands on the NEWEST message.
+    pinThreadToBottom();
+  } catch (e) {
+    state.discussHydrating = false;
+    if (e instanceof AuthError) {
+      toast("Session expired — signing you back in…");
+      auth.clear(); setTimeout(() => auth.login(), 600);
+      return;
+    }
+    if (e instanceof NotFoundError || (e && e.name === "NotFoundError")) {
+      toast("That discussion doesn't exist (or isn't yours).", "err");
+      goEntry(true);
+      return;
+    }
+    state.discussError = (e && e.message) || "Could not open that discussion.";
+    render();
+  }
+}
+
+async function loadDiscussions() {
+  if (!api.listDiscussions) return;
+  try { state.discussions = await api.listDiscussions(); }
+  catch { /* the Apps list must render without its drafts rather than not at all */ }
+}
+
+// ----- one exchange -------------------------------------------------------
+async function sendDiscussMessage(text) {
+  text = (text || "").trim();
+  if (!text || state.discussThinking) return;
+  const d = state.discussion;
+  if (!d || !d.id) return;              // the opening turn is still in flight
+
+  state.discussDraft = "";
+  state.discussError = "";
+  d.messages = (d.messages || []).concat([{ role: "user", text }]);
+  state.discussThinking = true;
+  // CASE 2: the user caused this, so they must SEE their words land — pinned, not jumped
+  // once, because the composer collapsing back to one line moves the height a frame later.
+  repaintDiscuss("send");
+
+  try {
+    const fresh = await api.sayDiscussion(d.id, text);
+    if (!state.discussion || state.discussion.id !== d.id) return;   // left the room mid-flight
+    state.discussion = fresh;
+    state.discussThinking = false;
+    // CASE 3: the reply arrived on its own clock. A reader who scrolled up to re-read an
+    // earlier answer stays where they are; one who was at the bottom follows the new turn.
+    repaintDiscuss("poll");
+  } catch (e) {
+    if (!state.discussion || state.discussion.id !== d.id) return;
+    state.discussThinking = false;
+    state.discussError = (e && e.message) || "That didn't get through — try again.";
+    repaintDiscuss("send");
+  }
+}
+
+// A multi-choice chip. It POSTS THE OPTION AS THE USER'S MESSAGE rather than sending a
+// hidden answer id, so the transcript says "a team" in the same place it would have said it
+// had the user typed it — the thread stays an honest record of what was decided.
+function answerWithChip(option) {
+  if (state.discussThinking) return;
+  sendDiscussMessage(option);
+}
+
+// ----- the room -----------------------------------------------------------
+function discussTopbar() {
+  const d = state.discussion;
+  const title = (d && (canvasField("name") || d.title)) || "New discussion";
+  return el("div", { class: "topbar" },
+    el("div", { class: "brand", role: "button", title: "Home", style: "cursor:pointer",
+      onclick: () => goEntry() },
+      el("div", { class: "logo" }, "B"),
+      el("span", {}, "MikeOS BuilderApps")),
+    el("div", { class: "discuss-title" },
+      el("span", { class: "discuss-chip-draft" }, "Draft"),
+      el("span", { class: "discuss-title-text", title }, title)),
+    el("div", { class: "spacer" }),
+    costNote(),
+    // RULE 1: always here, always enabled. Not disabled while the model is thinking either —
+    // waiting for a paragraph you have already decided you do not need is a gate by another
+    // name. The only thing that disables it is the build already being under way.
+    el("button", { class: "btn primary discuss-build",
+      disabled: state.discussBuilding || !d,
+      title: "Build this now — everything decided so far is sent to the pipeline",
+      onclick: () => buildFromDiscussion() },
+      state.discussBuilding ? el("span", { class: "spin" }) : null,
+      el("span", {}, state.discussBuilding ? "Starting the build…" : "Build it"),
+      state.discussBuilding ? null : el("span", { html: "&#8594;", style: "margin-left:4px" })),
+    el("button", { class: "btn ghost sm", title: "Back to the start page",
+      onclick: () => goEntry() }, "Close"));
+}
+
+// A discussion is text only — no containers — so it costs cents. Saying so out loud is the
+// honest version of "this is cheap", and it is the same accounting every build gets.
+function costNote() {
+  const d = state.discussion;
+  const c = d ? Number(d.cost_usd || 0) : 0;
+  if (!c) return null;
+  return el("span", { class: "discuss-cost",
+    title: "What this conversation has cost so far. It is carried into the app's Usage when "
+         + "you build." }, "$" + (c < 0.01 ? c.toFixed(4) : c.toFixed(3)));
+}
+
+function discussPanel() {
+  const thread = el("div", { class: "chat-thread", id: "chat-thread" });
+  const d = state.discussion;
+
+  if (state.discussHydrating) {
+    thread.appendChild(el("div", { class: "msg assistant" }, el("div", { class: "avatar" }, "B"),
+      el("div", { class: "bubble" }, el("div", { class: "hydrating" },
+        el("span", { class: "spin sm" }), el("span", {}, "Loading this discussion…")))));
+  } else if (d) {
+    for (const m of (d.messages || [])) thread.appendChild(discussBubble(m));
+    if (state.discussThinking) thread.appendChild(thinkingBubble());
+  }
+  if (state.discussError) {
+    thread.appendChild(el("div", { class: "msg assistant" }, el("div", { class: "avatar" }, "B"),
+      el("div", { class: "bubble error" }, state.discussError)));
+  }
+  return el("div", { class: "left chat discuss" }, thread, discussComposer());
+}
+
+function thinkingBubble() {
+  return el("div", { class: "msg assistant" }, el("div", { class: "avatar" }, "B"),
+    el("div", { class: "bubble" },
+      el("div", { class: "thinking" },
+        el("span", { class: "dot-pulse" }), el("span", { class: "dot-pulse" }),
+        el("span", { class: "dot-pulse" }),
+        el("span", { class: "thinking-lbl" }, "thinking…"))));
+}
+
+function discussBubble(m) {
+  if (m.role === "user") {
+    return el("div", { class: "msg user" }, el("div", { class: "bubble" }, m.text));
+  }
+  const bubble = el("div", { class: "bubble" + (m.error ? " error" : "") });
+  // PROVENANCE FIRST, above the prose it justifies. A model that quietly absorbs a page and
+  // then states facts is indistinguishable from one that made them up, and this project has
+  // been bitten by confident-but-unverifiable output more than once.
+  for (const s of (m.sources || [])) bubble.appendChild(sourceLine(s));
+  if (m.text) bubble.appendChild(el("div", { class: "msg-text", html: mdToHtml(m.text) }));
+  // "show me the vision" renders the brief INLINE, as a snapshot of what it said at the time
+  // — re-rendering today's canvas into an old message would rewrite history on every reload.
+  if (m.shown) bubble.appendChild(visionCard(m.show, m.shown));
+  if (m.questions && m.questions.length) bubble.appendChild(questionList(m.questions));
+  return el("div", { class: "msg assistant" }, el("div", { class: "avatar" }, "B"), bubble);
+}
+
+function sourceLine(s) {
+  if (!s) return null;
+  if (s.ok) {
+    const words = Number(s.words || 0).toLocaleString();
+    return el("div", { class: "src-line ok", title: s.title || s.url },
+      el("span", { class: "src-ico", html: "&#127760;" }),
+      el("span", {}, "read "),
+      el("a", { href: s.url, target: "_blank", rel: "noopener noreferrer" }, s.label || s.url),
+      el("span", { class: "src-meta" }, ` (${words} word${words === "1" ? "" : "s"})`));
+  }
+  return el("div", { class: "src-line bad", title: s.error || "" },
+    el("span", { class: "src-ico" }, s.refused ? "🚫" : "⚠"),
+    el("span", {}, (s.refused ? "refused " : "could not read ")),
+    el("span", { class: "src-url" }, s.label || s.url),
+    s.error ? el("span", { class: "src-meta" }, " — " + s.error) : null);
+}
+
+function visionCard(kind, markdown) {
+  return el("div", { class: "vision-card" },
+    el("div", { class: "vision-card-head" },
+      el("span", { class: "vc-ico", html: "&#9788;" }),
+      el("span", {}, kind === "canvas" ? "The brief, as it stands" : "The vision, as it stands")),
+    el("div", { class: "vision-card-body", html: mdToHtml(markdown) }));
+}
+
+function questionList(questions) {
+  const box = el("div", { class: "q-list" });
+  questions.forEach((q, i) => {
+    const item = el("div", { class: "q-item" },
+      el("div", { class: "q-head" },
+        el("span", { class: "q-num" }, String(i + 1)),
+        el("span", { class: "q-text" }, q.q)));
+    if (q.why) item.appendChild(el("div", { class: "q-why" }, q.why));
+    if (q.options && q.options.length) {
+      const opts = el("div", { class: "q-opts" });
+      for (const o of q.options) {
+        const rec = q.recommended && o.toLowerCase() === String(q.recommended).toLowerCase();
+        opts.appendChild(el("button", {
+          class: "q-opt" + (rec ? " rec" : ""),
+          disabled: state.discussThinking,
+          title: rec ? "Recommended — click to answer with this" : "Click to answer with this",
+          onclick: () => answerWithChip(o) },
+          o, rec ? el("span", { class: "q-rec" }, "recommended") : null));
+      }
+      // RULE 2 made visible: the chips are not the whole menu.
+      opts.appendChild(el("span", { class: "q-free" }, "…or just type your own answer"));
+      item.appendChild(opts);
+    }
+    box.appendChild(item);
+  });
+  return box;
+}
+
+function discussComposer() {
+  const ta = el("textarea", { id: "prompt", class: "chat-input", rows: 1,
+    placeholder: state.discussThinking ? "Thinking…"
+                                       : "Answer, ask, or say \"show me the vision\"…",
+    disabled: state.discussThinking });
+  ta.value = state.discussDraft || "";
+  ta.addEventListener("input", () => { state.discussDraft = ta.value; autoGrow(ta); });
+
+  const send = () => {
+    const v = ta.value.trim();
+    if (!v) return;
+    sendDiscussMessage(v);
+  };
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+
+  const sendBtn = el("button", { class: "btn primary chat-send", title: "Send",
+    disabled: state.discussThinking, onclick: send },
+    state.discussThinking ? el("span", { class: "spin" }) : el("span", { html: "&#8593;" }));
+
+  // Whoever mounted last owns the imperative handles (see captureComposerFocus): the
+  // discussion composer is the only one on screen in this view, so it takes the same slot.
+  composerRef = { setText: (t) => { ta.value = t; state.discussDraft = t; autoGrow(ta); },
+                  refresh: () => {}, resync: () => {} };
+
+  return el("div", { class: "composer" },
+    el("div", { class: "composer-hint" },
+      "Nothing is built until you press Build it — and you can press it at any time."),
+    el("div", { class: "composer-row" }, ta, sendBtn));
+}
+
+// ----- the project canvas (right side) ------------------------------------
+function canvasField(name) {
+  const c = (state.discussion && state.discussion.canvas) || {};
+  const cell = c[name];
+  if (!cell) return name === "features" || name === "out_of_scope" ? [] : "";
+  return (cell && typeof cell === "object" && "value" in cell) ? cell.value : cell;
+}
+function canvasAgreed(name) {
+  const c = (state.discussion && state.discussion.canvas) || {};
+  return !!(c[name] && c[name].agreed);
+}
+const CANVAS_ROWS = [
+  ["vision",       "Vision"],
+  ["audience",     "Who it's for"],
+  ["features",     "Core features"],
+  ["stack",        "Stack / data"],
+  ["out_of_scope", "Out of scope"],
+];
+function canvasHasContent() {
+  if (!state.discussion) return false;
+  return CANVAS_ROWS.some(([k]) => {
+    const v = canvasField(k);
+    return Array.isArray(v) ? v.length : !!v;
+  }) || !!canvasField("name");
+}
+
+function canvasPanel() {
+  // "Appears once there's content": an empty panel on the first paint would just be a
+  // rectangle promising something, and the opening turn fills it a few seconds later anyway.
+  if (!canvasHasContent()) return el("div", { class: "right canvas-empty" });
+  if (!state.canvasOpen) {
+    return el("div", { class: "right canvas-collapsed" },
+      el("button", { class: "canvas-toggle", title: "Show the project canvas",
+        onclick: () => { state.canvasOpen = true; render(); } },
+        el("span", { html: "&#9664;" }), el("span", { class: "ct-label" }, "Canvas")));
+  }
+
+  const body = el("div", { class: "canvas-body" });
+  const name = canvasField("name");
+  if (name) {
+    body.appendChild(el("div", { class: "canvas-name" }, name,
+      canvasAgreed("name") ? agreedTick() : null));
+  }
+  for (const [key, label] of CANVAS_ROWS) {
+    const v = canvasField(key);
+    if (Array.isArray(v) ? !v.length : !v) continue;
+    const row = el("div", { class: "canvas-row" },
+      el("div", { class: "canvas-label" }, label, canvasAgreed(key) ? agreedTick() : null));
+    if (Array.isArray(v)) {
+      const ul = el("ul", { class: "canvas-list" });
+      for (const item of v) ul.appendChild(el("li", {}, item));
+      row.appendChild(ul);
+    } else {
+      row.appendChild(el("div", { class: "canvas-value" }, v));
+    }
+    body.appendChild(row);
+  }
+
+  // EVERY CHANGE TO AN AGREED DECISION IS SHOWN. The server refuses to overwrite one
+  // silently; this is where the refusal becomes visible — "we changed X to Y, because you
+  // said Z" — so a revision is something the user can catch, not something they discover in
+  // the built app.
+  const log = ((state.discussion && state.discussion.canvas) || {}).changelog || [];
+  if (log.length) {
+    const box = el("div", { class: "canvas-changes" },
+      el("div", { class: "canvas-label" }, "Changed along the way"));
+    for (const c of log.slice(-5)) {
+      box.appendChild(el("div", { class: "canvas-change" },
+        el("strong", {}, c.label || c.field), ": ",
+        el("span", { class: "cc-from" }, c.from || "—"),
+        el("span", { class: "cc-arrow", html: " &#8594; " }),
+        el("span", { class: "cc-to" }, c.to || ""),
+        c.because ? el("div", { class: "cc-why" }, c.because) : null));
+    }
+    body.appendChild(box);
+  }
+
+  return el("div", { class: "right canvas" },
+    el("div", { class: "canvas-head" },
+      el("span", { class: "canvas-title" }, "Project canvas"),
+      el("button", { class: "canvas-x", title: "Hide the canvas",
+        onclick: () => { state.canvasOpen = false; render(); } }, "✕")),
+    body,
+    el("div", { class: "canvas-foot" },
+      "This is what Build it sends to the pipeline."));
+}
+
+function agreedTick() {
+  return el("span", { class: "agreed-tick", title: "You decided this — it won't be changed "
+    + "without telling you" }, "✓");
+}
+
+// ----- the anti-flicker gate + scroll policy, for this room ----------------
+// Same three cases and the same reasoning as repaintLeft() — see THE SCROLL POLICY above.
+// A separate signature because a different pane is being compared, not a different policy.
+function discussSignature() {
+  try {
+    const d = state.discussion;
+    return JSON.stringify({
+      i: d && d.id,
+      t: state.discussThinking,
+      h: state.discussHydrating,
+      b: state.discussBuilding,
+      e: state.discussError,
+      m: ((d && d.messages) || []).map((m) => [m.role, m.text, (m.questions || []).length,
+                                               (m.sources || []).length, m.show]),
+      c: d ? JSON.stringify(d.canvas || {}) : null,
+      // state.discussDraft is deliberately absent: it is the one thing a repaint never
+      // DELIVERS (the composer re-seeds itself from it), so including it would repaint on
+      // every keystroke and take the caret with it.
+    });
+  } catch { return String(Math.random()); }   // never suppress a paint on an error
+}
+
+let _discussSig = null;
+function repaintDiscuss(reason) {
+  const old = document.querySelector(".split > .left");
+  if (!old || state.view !== "discuss") { render(); return; }
+  const userDriven = reason === "send" || reason === "open";
+  const sig = discussSignature();
+  if (!userDriven && sig === _discussSig) return;   // nothing new — leave the DOM alone
+  _discussSig = sig;
+
+  const sc = threadEl(old);
+  const wasNearBottom = !sc
+    || (sc.scrollHeight - sc.scrollTop - sc.clientHeight) < NEAR_BOTTOM_PX;
+  const prevTop = sc ? sc.scrollTop : 0;
+  const cap = captureComposerFocus(old);
+
+  old.replaceWith(discussPanel());
+  restoreComposerFocus(cap);
+
+  // The canvas moves with the conversation, and the header carries the running cost.
+  const rightOld = document.querySelector(".split > .right");
+  if (rightOld) rightOld.replaceWith(canvasPanel());
+  const barOld = document.querySelector(".topbar");
+  if (barOld) barOld.replaceWith(discussTopbar());
+
+  if (userDriven) { pinThreadToBottom(); return; }
+
+  const next = threadEl(document.querySelector(".split > .left"));
+  if (next) {
+    if (wasNearBottom) { pinThreadToBottom(); }
+    else { cancelThreadPin(); scrollTo(next, prevTop); }
+  }
+}
+
+// ----- Build it -----------------------------------------------------------
+// THE PAYOFF. The pipeline is handed the BRIEF — canvas plus the discussion — instead of the
+// sentence the room started from. The brief itself is composed SERVER-SIDE from the stored
+// discussion (see `discuss.compose_brief`): the browser asking for it here is only so the
+// user can see what was sent, and `discussion_id` is what actually decides it, so a stale or
+// truncated client copy can never become the specification.
+async function buildFromDiscussion() {
+  const d = state.discussion;
+  if (!d || !d.id || state.discussBuilding) return;
+  state.discussBuilding = true;
+  render();
+
+  let brief = "";
+  let title = "";
+  try {
+    const b = await api.discussionBrief(d.id);
+    brief = (b && b.brief) || "";
+    title = (b && b.title) || "";
+  } catch { /* the server composes it again from discussion_id anyway */ }
+
+  const discussionId = d.id;
+  const seed = d.seed || "";
+  const summary = briefSummary();
+  state.discussBuilding = false;
+
+  // From here it behaves exactly as Build it always has: an empty builder, /builder, the
+  // create stream. The ONLY difference is what the pipeline is told.
+  resetBuilder();
+  resetDiscussion();
+  goBuilder();
+  pushMessage("user", { text: summary });
+  onCreate(brief || seed, { discussionId, title });
+  loadDiscussions();
+}
+
+// What the builder thread shows as the opening message: the DECISIONS, not the whole brief.
+// The full brief (which includes the transcript) is what goes to the pipeline and is
+// inspectable at GET /api/discussions/<id>/brief — pasting all of it into a chat bubble
+// would bury the decisions it exists to make legible.
+function briefSummary() {
+  const lines = ["Build this — here's what we agreed:"];
+  const name = canvasField("name");
+  if (name) lines.push("**" + name + "**");
+  const vision = canvasField("vision");
+  if (vision) lines.push(vision);
+  for (const [key, label] of CANVAS_ROWS) {
+    if (key === "vision") continue;
+    const v = canvasField(key);
+    if (Array.isArray(v) ? !v.length : !v) continue;
+    lines.push("**" + label + ":** " + (Array.isArray(v) ? v.join(", ") : v));
+  }
+  lines.push("_(the full brief, including our discussion, was sent to the pipeline)_");
+  return lines.join("\n\n");
 }
 
 function bootScreen() {
@@ -3666,7 +4305,11 @@ function currentTitle() {
   return "New app";
 }
 
-async function onCreate(prompt) {
+// `opts.discussionId` (phase 34) makes the SERVER compose the brief from that discussion and
+// build from it — `prompt` is then only the fallback for a control plane that predates the
+// discussion room. `opts.title` carries a name that was AGREED, which beats one invented from
+// the prompt (the "named after its own buyer persona" bug).
+async function onCreate(prompt, opts = {}) {
   prompt = (prompt || "").trim();
   if (!prompt) return;
   state.generating = true;
@@ -3676,7 +4319,10 @@ async function onCreate(prompt) {
   render();
   await guard(async () => {
     const onEvent = makeStreamHandler();
-    await api.createProjectStream({ prompt }, onEvent);
+    const payload = { prompt };
+    if (opts.discussionId) payload.discussion_id = opts.discussionId;
+    if (opts.title) payload.title = opts.title;
+    await api.createProjectStream(payload, onEvent);
     // Refresh the authoritative project row + list after the stream closes.
     if (state.project) {
       try { const fresh = await api.getProject(state.project.id); adoptProject(fresh); } catch {}
@@ -4257,6 +4903,7 @@ async function boot() {
 
   const deepId = syncViewFromPath();
   await loadProjects();
+  loadDiscussions();             // fire-and-forget; the Apps list shows drafts when it has them
   loadProfile();                 // fire-and-forget; Profile view re-reads state.profile
   state.booting = false;
 
@@ -4271,10 +4918,23 @@ async function boot() {
     onCreate(pending);
     return;
   }
+  // …and the same for a sentence that was sent to DISCUSS while logged out.
+  let pendingDiscuss = null;
+  try { pendingDiscuss = sessionStorage.getItem(PENDING_DISCUSS_KEY); } catch {}
+  if (cameFromCallback && pendingDiscuss) {
+    try { sessionStorage.removeItem(PENDING_DISCUSS_KEY); } catch {}
+    render();
+    goDiscuss(true, null);
+    openTurn(pendingDiscuss);
+    return;
+  }
 
   // Deep link / RELOAD of /builder/<id>: rebuild the whole workspace from the
   // server — chat thread, executed pipeline steps, status pill and preview.
   if (state.view === "builder" && deepId) { await enterProject(deepId, { navigate: false }); return; }
+  // Deep link / RELOAD / SHARED LINK of /discuss/<id>: the same contract for the room —
+  // the whole conversation, its questions, what it read and the canvas, from the server.
+  if (state.view === "discuss" && deepId) { await enterDiscussion(deepId, { navigate: false }); return; }
 
   render();
 }
