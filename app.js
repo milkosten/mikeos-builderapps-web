@@ -1372,19 +1372,24 @@ async function buildFromDiscussion() {
 // The full brief (which includes the transcript) is what goes to the pipeline and is
 // inspectable at GET /api/discussions/<id>/brief — pasting all of it into a chat bubble
 // would bury the decisions it exists to make legible.
+//
+// PLAIN TEXT, no Markdown. A user bubble renders its text verbatim (chatBubble), which is
+// right — it is what the human said — so `**PennyWise**` here reached the screen with the
+// asterisks showing. Every other user message in this app is plain, and this one is a user
+// message; the fix is to write plain, not to start parsing Markdown in a user's own words.
 function briefSummary() {
   const lines = ["Build this — here's what we agreed:"];
   const name = canvasField("name");
-  if (name) lines.push("**" + name + "**");
   const vision = canvasField("vision");
-  if (vision) lines.push(vision);
+  if (name) lines.push(vision ? name + " — " + vision : name);
+  else if (vision) lines.push(vision);
   for (const [key, label] of CANVAS_ROWS) {
     if (key === "vision") continue;
     const v = canvasField(key);
     if (Array.isArray(v) ? !v.length : !v) continue;
-    lines.push("**" + label + ":** " + (Array.isArray(v) ? v.join(", ") : v));
+    lines.push(label + ": " + (Array.isArray(v) ? v.join(", ") : v));
   }
-  lines.push("_(the full brief, including our discussion, was sent to the pipeline)_");
+  lines.push("(The full brief, including our discussion, was sent to the pipeline.)");
   return lines.join("\n\n");
 }
 
