@@ -1617,11 +1617,20 @@ function capMeta(id) {
   return caps.find((c) => c.id === id) || { id, label: id, detail: "" };
 }
 
+// Fetched once per session. The in-flight promise is cached too: the tab re-renders a few
+// times while the first request is still open, and without this each render fired another
+// identical GET.
+let _catalogReq = null;
 async function loadAsstCatalog() {
   if (state.asstCatalog) return state.asstCatalog;
-  try { state.asstCatalog = await api.assistantsCatalog(); }
-  catch { state.asstCatalog = { templates: [], capabilities: [], limits: {} }; }
-  return state.asstCatalog;
+  if (_catalogReq) return _catalogReq;
+  _catalogReq = (async () => {
+    try { state.asstCatalog = await api.assistantsCatalog(); }
+    catch { state.asstCatalog = { templates: [], capabilities: [], limits: {} }; }
+    _catalogReq = null;
+    return state.asstCatalog;
+  })();
+  return _catalogReq;
 }
 
 function assistantsTab() {
