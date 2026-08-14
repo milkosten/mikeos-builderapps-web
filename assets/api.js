@@ -9,6 +9,7 @@
 //   POST /api/projects/{id}/update {request}-> SSE stream (update pipeline; may 404)
 //   PUT  /api/projects/{id}/messages {messages:[{role,text}]}  -> persist the chat thread
 //   GET  /api/projects/{id}/steps           -> {steps:[...], status} (poll a running run)
+//   GET  /api/projects/{id}/assistant-activity?limit= -> {beating, beats:[{...,activity:[...]}]}
 // Workspace tabs (all GET /api/projects/{id}/...; any of them may 404 until the
 // backend ships them — callers MUST degrade to an empty state, never an error):
 //   /docs · /docs/{name} · /files?path= · /file?path= · /database · /secrets[?reveal=1]
@@ -161,6 +162,11 @@ const live = {
   assistantAction:   (id, aid, action) =>
     req("POST", `/api/projects/${encodeURIComponent(id)}/assistants/${aid}/${action}`, {}),
   assistantBeats:    (id, aid) => sub(id, `assistants/${aid}/beats`),
+  // The project-wide activity feed: what every assistant has actually been DOING,
+  // line by line (phases, tool calls, results). Beats oldest-first, and a running
+  // beat's `activity` array grows between polls. Narrated in the builder's LEFT pane.
+  assistantActivity: (id, limit) =>
+    sub(id, `assistant-activity?limit=${encodeURIComponent(limit || 6)}`),
 };
 
 // The exported client picks live or mock at module-load time.

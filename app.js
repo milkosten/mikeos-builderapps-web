@@ -49,6 +49,13 @@ const state = {
   // Executed pipeline steps rebuilt FROM THE SERVER (latest_run.steps) on load.
   // Kept out of state.messages so it never pollutes the persisted thread.
   runHistory: null,   // { kind, request, status, steps:[{label,pending,failed}] }
+
+  // What the AI assistants have actually been DOING, straight from the server
+  // (GET .../assistant-activity). SERVER-OWNED, exactly like runHistory: rendered as
+  // its own bubbles and NEVER written back. It must not go anywhere near
+  // state.messages — compactMessages() PUTs that thread and the server REPLACES it,
+  // so anything of the server's parked there gets clobbered on the next save.
+  assistantActivity: null,   // { beating, beats:[{beat_id,name,role,status,activity:[…]}] }
 };
 
 // A prompt the user submitted while logged out is stashed here (and in sessionStorage)
@@ -95,6 +102,7 @@ function navigate(view, { replace = false, id = undefined } = {}) {
   const fn = replace ? "replaceState" : "pushState";
   if (location.pathname !== path) history[fn](null, "", path);
   render();
+  ensureActivityPoll();   // leaving the builder kills the feed's tick chain; coming back re-arms it
 }
 function goBuilder(replace, id) { navigate("builder", { replace: !!replace, id }); }
 function goEntry(replace)   { navigate("entry",   { replace: !!replace, id: null }); }
@@ -125,6 +133,7 @@ window.addEventListener("popstate", () => {
   }
   if (state.view === "builder" && !id) resetBuilder();
   render();
+  ensureActivityPoll();   // back/forward onto the SAME project: nothing re-hydrates, so re-arm here
 });
 
 // mutable ref to the assistant message currently being narrated by the SSE stream
@@ -698,12 +707,14 @@ function leftPanel() {
     thread.appendChild(el("div", { class: "msg assistant" }, el("div", { class: "avatar" }, "B"),
       el("div", { class: "bubble" }, el("div", { class: "hydrating" },
         el("span", { class: "spin sm" }), el("span", {}, "Loading this app's history…")))));
-  } else if (!state.messages.length && !state.runHistory) {
+  } else if (!state.messages.length && !state.runHistory && !activityBeats().length) {
     thread.appendChild(chatIntro());
   } else {
     for (const m of state.messages) thread.appendChild(chatBubble(m));
     // Executed steps replayed from the server go last, below the conversation.
     if (state.runHistory) thread.appendChild(runHistoryBubble(state.runHistory));
+    // …and below THAT, what the assistants have been doing since (oldest beat first).
+    for (const b of activityBeats()) thread.appendChild(assistantBeatBubble(b));
   }
   return el("div", { class: "left chat" }, thread, composer());
 }
@@ -799,6 +810,97 @@ function runToHistory(run) {
                 : steps.some((s) => s.failed) ? "failed" : "done";
   return { kind: run.kind || "create", request: run.request || "",
            status: run.status || derived, steps };
+}
+
+// ----- what the ASSISTANTS have actually been doing (server-owned feed) -----
+// One bubble per beat, ATTRIBUTED to the assistant that ran it, with the harness's own
+// lines underneath — this is the pane where a user can see that something is happening.
+// Rendered strictly from what the API returned: no synthesised progress, no optimistic
+// "working…" filler. A running beat with nothing reported yet says exactly that.
+// Deliberately NOT in state.messages (see the state comment) — it is never persisted back.
+function activityBeats() {
+  const f = state.assistantActivity;
+  return (f && Array.isArray(f.beats)) ? f.beats : [];
+}
+
+// Two assistants must not read as one voice, so each gets a stable hue derived from its
+// id (avatar + bubble edge). Deterministic, so a repaint never reshuffles the colours.
+function assistantHue(id) {
+  const n = Number(id);
+  return (((Number.isFinite(n) ? n : 0) * 67) + 200) % 360;
+}
+
+function beatMark(status) {
+  if (status === "running") return el("span", { class: "spin sm" });
+  if (status === "failed")  return el("span", { class: "aa-mark bad" }, "✗");
+  if (status === "skipped") return el("span", { class: "aa-mark skip" }, "∅");
+  return el("span", { class: "aa-mark ok" }, "✓");
+}
+
+function fmtCost(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  return "$" + (n < 1 ? n.toFixed(4) : n.toFixed(2));
+}
+
+function assistantBeatBubble(b) {
+  const status = String(b.status || "done").toLowerCase();
+  const running = status === "running";
+  const hue = assistantHue(b.assistant_id);
+  const name = String(b.name || "Assistant");
+  const role = String(b.role || "");
+  const bubble = el("div", { class: "bubble assistant-activity" + (running ? " running" : ""),
+                             style: "--aa-hue:" + hue });
+
+  // Attribution first — WHO did this and whether it finished. Cost only once the beat is
+  // over: a running total is not final and would churn the line on every poll.
+  const cost = running ? "" : fmtCost(b.cost_usd);
+  bubble.appendChild(el("div", { class: "aa-head" },
+    beatMark(status),
+    el("strong", { class: "aa-who" }, role && role !== name ? name + " · " + role : name),
+    el("span", { class: "spacer" }),
+    cost ? el("span", { class: "aa-cost" }, cost) : null));
+
+  const trigger = b.trigger_kind === "schedule" ? "scheduled beat" : "manual beat";
+  const outcome = running ? "working…" : status === "skipped" ? "nothing to do"
+                : status === "failed" ? "failed" : "finished";
+  bubble.appendChild(el("div", { class: "aa-sub" },
+    trigger + (b.ts ? " · " + fmtDate(b.ts) : "") + " · " + outcome));
+
+  const lines = Array.isArray(b.activity) ? b.activity : [];
+  if (lines.length) {
+    const list = el("div", { class: "aa-lines" });
+    for (const ln of lines) list.appendChild(activityLine(ln || {}));
+    bubble.appendChild(list);
+  } else {
+    bubble.appendChild(el("div", { class: "aa-empty" },
+      running ? "started — no activity reported yet" : "no activity reported"));
+  }
+
+  return el("div", { class: "msg assistant aa-msg" },
+    el("div", { class: "avatar aa-avatar", style: "--aa-hue:" + hue, title: name },
+      name.slice(0, 1).toUpperCase() || "A"),
+    bubble);
+}
+
+// One harness line. `icon` is picked SERVER-SIDE — render it as given rather than
+// re-deciding here, so the pane says exactly what the backend reported.
+const ACTIVITY_KINDS = ["phase", "tool", "text", "result"];
+function activityLine(ln) {
+  const kind = String(ln.kind || "").toLowerCase();
+  let cls = "aa-line k-" + (ACTIVITY_KINDS.includes(kind) ? kind : "text");
+  if (kind === "result" && ln.ok === true)  cls += " ok";
+  if (kind === "result" && ln.ok === false) cls += " bad";
+  const text = ln.text == null ? "" : String(ln.text);
+  const detail = ln.detail == null ? "" : String(ln.detail);
+  const body = el("div", { class: "aa-body" }, el("span", { class: "aa-text" }, text));
+  // `detail` can be a whole tool payload; keep it secondary and clamped, with the full
+  // text on hover so nothing the assistant reported is actually lost.
+  if (detail) body.appendChild(el("div", { class: "aa-detail" }, detail));
+  return el("div", { class: cls, title: detail || text },
+    el("span", { class: "aa-icon" }, String(ln.icon || "·")),
+    body,
+    ln.ts ? el("span", { class: "aa-ts" }, String(ln.ts)) : null);
 }
 
 // The composer pinned at the bottom of the left.
@@ -915,9 +1017,26 @@ function stepSig(arr) {
                                  (s.log || "").length].join("~")).join("|");
 }
 
+// Same contract for the assistant feed, and the same trap: the activity array GROWS a
+// line at a time, so the signature has to move when a line is appended and stay put on a
+// no-op poll (2.5s while a beat runs). Length + the last line is enough — the array is
+// append-only server-side — and it stays cheap next to hashing 400 lines every tick.
+// Like stepSig this must be TOTAL: a throw here lands in the catch below and silently
+// re-enables the repaint-every-tick bug the gate exists to prevent.
+function activitySig(feed) {
+  const beats = (feed && feed.beats) || [];
+  return beats.map((b) => {
+    const acts = (b && b.activity) || [];
+    const last = acts.length ? acts[acts.length - 1] : null;
+    return [b && b.beat_id, b && b.assistant_id, b && b.status, b && b.cost_usd, acts.length,
+            last && last.text, last && last.ts, last && last.ok].join("~");
+  }).join("|");
+}
+
 function leftSignature() {
   try {
     const rh = state.runHistory;
+    const aa = state.assistantActivity;
     return JSON.stringify({
       p: state.project && state.project.id,
       s: state.project && state.project.status,
@@ -925,6 +1044,7 @@ function leftSignature() {
       h: state.hydrating,
       m: (state.messages || []).map((m) => [m.role, m.text, m.kind, stepSig(m.steps)]),
       r: rh ? [rh.kind, rh.status, rh.request, stepSig(rh.steps)] : null,
+      a: aa ? [!!aa.beating, activitySig(aa)] : null,
     });
   } catch { return String(Math.random()); }   // never suppress a paint on an error
 }
@@ -2081,6 +2201,7 @@ async function assistantAct(aid, action) {
     if (action === "beat") {
       toast("Beat started — it runs in a container and takes ~30-90s.", "ok");
       startBeatPoll(aid);
+      startActivityPoll();     // narrate it in the left pane from the very first line
     } else {
       toast(action === "start" ? "Heartbeat started." : "Heartbeat paused.", "ok");
     }
@@ -2104,6 +2225,9 @@ function startBeatPoll(aid) {
   state.asstPoll = setInterval(async () => {
     ticks++;
     if (ticks > 60 || state.tab !== "assistants") { stopBeatPoll(); return; }
+    // Ride this existing tick for the left pane too rather than racing a second timer
+    // against it — refreshAssistantActivity() de-dupes its own in-flight request.
+    refreshAssistantActivity();
     try {
       if (state.asstSel === aid) {
         await loadAssistantDetail(aid, true);
@@ -2337,6 +2461,9 @@ async function onCreate(prompt) {
     invalidateTabs();
     await loadProjects();
     render();
+    // The app now EXISTS, so its assistants can start beating — begin watching the feed
+    // without waiting for the user to reload the page.
+    startActivityPoll();
     toast("App built.", "ok");
   }).catch((e) => {
     finalizeLiveMsg("Sorry — the build failed. " + (e && e.message ? e.message : "Please try again."), "error");
@@ -2397,11 +2524,16 @@ function openProject(id) {
 // Clear the builder back to its empty state (bare /builder, or a brand-new app).
 function resetBuilder() {
   stopStepPolling();
+  stopActivityPoll();
   clearInterval(logsTimer); logsTimer = null; state.logsAuto = false;
   state.project = null;
   state.live = null;
   state.messages = [];
   state.runHistory = null;
+  // A different app's feed must never bleed into this one; and "the endpoint is missing"
+  // was a verdict about the LAST project's fetch, so re-test it for the next one.
+  state.assistantActivity = null;
+  activityMisses = 0; activityAbsent = false;
   state.previewNonce = 0;
   state.tab = "site";
   state.openTabs = [];
@@ -2456,6 +2588,11 @@ async function enterProject(id, { navigate = true } = {}) {
 
   // A run that is still executing must not be left as a dead, frozen list.
   maybeResumeRun();
+
+  // What the assistants have done comes from the server too, so a COLD reload of
+  // /builder/<id> shows the same lines a live beat wrote. Fires after the first paint
+  // so it can never delay the workspace.
+  startActivityPoll();
 }
 
 // Second source for the executed steps: GET /api/projects/{id}/steps. Runs after
@@ -2575,6 +2712,83 @@ function maybeResumeRun() {
     }
     repaintLeft();              // still running: only the step list changes
   }, 4000);
+}
+
+// ---------- the assistant activity feed (left pane) ----------
+// ONE self-rescheduling timer rather than a fixed setInterval, because the cadence has to
+// change: ~2.5s while a beat is actually running (the lines land seconds apart and the
+// point of the pane is watching them arrive), ~15s otherwise. A setTimeout chain also
+// makes overlapping requests structurally impossible — the next tick is only scheduled
+// once the previous one has returned.
+const ACTIVITY_HOT_MS = 2500;
+const ACTIVITY_IDLE_MS = 15000;
+let activityTimer = null;
+let activityInFlight = false;
+let activityMisses = 0;
+let activityAbsent = false;   // the endpoint 404s on this control plane: stop asking
+
+function stopActivityPoll() {
+  if (activityTimer) { clearTimeout(activityTimer); activityTimer = null; }
+}
+
+// "Hot" = the server says a beat is in flight, or one of the beats it returned is running.
+function activityIsHot() {
+  const f = state.assistantActivity;
+  if (!f) return false;
+  if (f.beating) return true;
+  return ((f.beats || []).some((b) => b && b.status === "running"));
+}
+
+function scheduleActivityPoll(delay) {
+  stopActivityPoll();
+  if (activityAbsent || state.view !== "builder" || !state.project) return;
+  const ms = delay != null ? delay
+    : (activityIsHot() && !activityMisses ? ACTIVITY_HOT_MS : ACTIVITY_IDLE_MS);
+  activityTimer = setTimeout(activityTick, ms);
+}
+
+async function activityTick() {
+  activityTimer = null;
+  // Left the builder (or the project) since the timer was armed: just let the chain die.
+  if (state.view !== "builder" || !state.project) return;
+  await refreshAssistantActivity();
+  scheduleActivityPoll();
+}
+
+// Start (or restart) the feed for the current project, first fetch immediately.
+function startActivityPoll() {
+  if (!state.project) return;
+  scheduleActivityPoll(0);
+}
+
+// Re-arm after a navigation that kept the same project — the tick chain deliberately
+// dies when the view leaves the builder. Idempotent: never a second timer, and it will
+// not fire a duplicate fetch on top of one already in the air.
+function ensureActivityPoll() {
+  if (state.view !== "builder" || !state.project || activityTimer || activityInFlight) return;
+  scheduleActivityPoll(0);
+}
+
+// Fetch the feed once. NEVER throws and never logs: a poll failure is not the user's
+// problem, and a 404 only means this control plane predates the endpoint.
+async function refreshAssistantActivity() {
+  const proj = state.project;
+  if (!proj || !api.assistantActivity || activityInFlight || activityAbsent) return;
+  activityInFlight = true;
+  try {
+    const feed = await api.assistantActivity(proj.id, 6);
+    // The user may have switched apps while this was in the air — never paint a feed
+    // from one project into another's thread.
+    if (!state.project || state.project.id !== proj.id) return;
+    state.assistantActivity = (feed && Array.isArray(feed.beats)) ? feed : null;
+    activityMisses = 0;
+    repaintLeft();     // gated by leftSignature(): a no-op poll paints nothing
+  } catch (e) {
+    if (e instanceof NotFoundError || (e && e.name === "NotFoundError")) activityAbsent = true;
+    else activityMisses++;      // transient: the next tick falls back to the idle cadence
+  } finally {
+    activityInFlight = false;
+  }
 }
 
 // Best-effort fetch of the OIDC userinfo for a richer Profile (name/email/avatar).

@@ -421,4 +421,51 @@ export const mockApi = {
   async deleteAssistant() { await wait(150); return { ok: true }; },
   async assistantAction() { await wait(150); return { ok: true, status: "running" }; },
   async assistantBeats() { await wait(120); return { beats: [] }; },
+
+  // The left-pane activity feed. The running beat REVEALS ONE MORE LINE per poll so
+  // ?mock=1 exercises the real thing the live feed does — an array that only grows —
+  // and therefore the anti-flicker signature and the 2.5s/15s cadence switch too.
+  async assistantActivity() {
+    await wait(90);
+    mockActivityTick++;
+    const shown = MOCK_RUNNING_ACTIVITY.slice(0, Math.min(mockActivityTick, MOCK_RUNNING_ACTIVITY.length));
+    const finished = shown.length >= MOCK_RUNNING_ACTIVITY.length;
+    return {
+      beating: !finished,
+      beats: [
+        { beat_id: 11, assistant_id: 1, name: "Product Owner", role: "Product Owner",
+          status: "done", trigger_kind: "schedule", cost_usd: 0.0071,
+          thought: "Sign-up exists but there is no way back in.",
+          ts: new Date(Date.now() - 26 * 60e3).toISOString(),
+          finished_at: new Date(Date.now() - 25 * 60e3).toISOString(),
+          activity: MOCK_DONE_ACTIVITY },
+        { beat_id: 12, assistant_id: 2, name: "Developer", role: "Developer",
+          status: finished ? "done" : "running", trigger_kind: "manual",
+          cost_usd: finished ? 0.0134 : 0,
+          thought: "The app has no accounts; I will add sessions.",
+          ts: new Date(Date.now() - 3 * 60e3).toISOString(),
+          finished_at: finished ? new Date().toISOString() : null,
+          activity: shown },
+      ],
+    };
+  },
 };
+
+let mockActivityTick = 0;
+const MOCK_DONE_ACTIVITY = [
+  { kind: "phase", icon: "📖", text: "reading the project's documents — read VISION.md, TECHNICAL-PLAN.md", ts: "15:41:02" },
+  { kind: "text", icon: "🧠", text: "Sign-up exists but there is no way back in — login is the gap.",
+    detail: "The vision promises returning users keep their lists, but there is no session handling at all.", ts: "15:41:19" },
+  { kind: "result", icon: "✓", text: "filed backlog item \"add a login route\"", ok: true, ts: "15:41:26" },
+];
+const MOCK_RUNNING_ACTIVITY = [
+  { kind: "phase", icon: "📖", text: "reading the project's documents — read VISION.md, TECHNICAL-PLAN.md", ts: "16:10:12" },
+  { kind: "text", icon: "🧠", text: "The app has no accounts; I will add sessions.", ts: "16:10:30" },
+  { kind: "tool", icon: "👀", text: "reading server.js", ts: "16:10:33" },
+  { kind: "tool", icon: "✎", text: "editing server.js", ts: "16:10:51" },
+  { kind: "tool", icon: "$", text: "rg -n 'app.get' server.js", ts: "16:10:55" },
+  { kind: "result", icon: "✓", text: "committed 3f9a1c2 \"add sessions + login\"", ok: true, ts: "16:11:20" },
+  { kind: "phase", icon: "🚀", text: "asking the control plane to build and health-gate this commit", ts: "16:11:21" },
+  { kind: "result", icon: "🔴", text: "health gate FAILED — rolled back to the last good commit", ok: false,
+    detail: "GET / returned 500: SessionStore is not a constructor", ts: "16:14:02" },
+];
