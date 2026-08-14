@@ -602,6 +602,10 @@ function startBuild(prompt) {
     auth.login();
     return;
   }
+  // A NEW app must start from an EMPTY builder. Without this, starting a build while an
+  // existing app was open appended the prompt to THAT app's thread and left its preview,
+  // tabs and status pill on screen — the new app looked "mixed up with another application".
+  resetBuilder();
   goBuilder();               // real /builder path, pushState
   pushMessage("user", { text: prompt });
   onCreate(prompt);
