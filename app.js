@@ -767,7 +767,10 @@ function runToHistory(run) {
                pending: s.status === "running",
                failed: s.status === "failed" };
     });
-  return { kind: run.kind || "create", request: run.request || "", status: run.status || "done", steps };
+  const derived = steps.some((s) => s.pending) ? "running"
+                : steps.some((s) => s.failed) ? "failed" : "done";
+  return { kind: run.kind || "create", request: run.request || "",
+           status: run.status || derived, steps };
 }
 
 // The composer pinned at the bottom of the left.
@@ -1753,8 +1756,27 @@ async function enterProject(id, { navigate = true } = {}) {
   state.hydrating = false;
   render();
 
+  // The executed step list is NOT allowed to depend on the project row carrying
+  // latest_run.steps. If it didn't, ask the dedicated endpoint and paint them in.
+  if (!state.runHistory || !state.runHistory.steps.length) backfillSteps(id);
+
   // A run that is still executing must not be left as a dead, frozen list.
   maybeResumeRun();
+}
+
+// Second source for the executed steps: GET /api/projects/{id}/steps. Runs after
+// the first paint so it can never delay or block the workspace.
+async function backfillSteps(id) {
+  if (!api.projectSteps) return;
+  let sr;
+  try { sr = await api.projectSteps(id); } catch { return; }
+  if (!sr || !(sr.steps || []).length) return;
+  if (!state.project || state.project.id !== id || state.generating) return;
+  if (state.runHistory && state.runHistory.steps.length) return;   // already painted
+  const base = state.project.latest_run || {};
+  state.runHistory = runToHistory({ kind: base.kind, request: base.request,
+                                    status: base.status, steps: sr.steps });
+  repaintLeft();
 }
 
 // Rebuild the conversation. Server `messages` is the authority; sessionStorage is
