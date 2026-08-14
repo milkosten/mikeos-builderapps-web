@@ -411,7 +411,14 @@ function refreshLiveMsg() {
   const thread = document.getElementById("chat-thread");
   if (idx < 0 || !thread) return;
   const node = thread.children[idx];
-  if (node) { node.replaceWith(chatBubble(liveMsg)); scrollThread(); }
+  if (!node) return;
+  // CASE 3: the pipeline narrating itself is a background change. Follow it down only if
+  // the reader is already at the bottom — a user who scrolled up to re-read the brief
+  // must not be dragged along by every step that completes.
+  const nearBottom =
+    (thread.scrollHeight - thread.scrollTop - thread.clientHeight) < NEAR_BOTTOM_PX;
+  node.replaceWith(chatBubble(liveMsg));
+  if (nearBottom) scrollThread();
 }
 
 // Add / update a status line on the live bubble, DEDUPING consecutive identical lines
@@ -1284,30 +1291,67 @@ function scrollThread() {
   if (t) t.scrollTop = t.scrollHeight;
 }
 
-// ----- landing a freshly-opened thread on the NEWEST message -----
-// Opening a project is not the same event as repainting one, and they want opposite
-// behaviour. repaintLeft() preserves the reader's place — correct, or a poll tick would
-// yank you out of the history you are reading. But that rule was also governing the FIRST
-// paint after hydration, where it pinned a long thread to the top and left the newest
-// message several screens below. Every chat client opens at the bottom; so does this one.
+// ============ THE SCROLL POLICY FOR THE CHAT THREAD ============================
+// Exactly three cases. Every repaint of the left pane DECLARES which one it is; none of
+// them is inferred.
 //
-// It has to run after the content is actually laid out: at the moment render() returns,
-// the thread's scrollHeight is still ~0 and setting scrollTop silently does nothing. Hence
-// a frame-later pass, plus two later ones for the pieces that hydrate asynchronously
-// (steps from /steps, assistant beats from /assistant-activity).
+//   "open"  first paint of a project — open, reload, switch app   -> go to the bottom
+//   "send"  the USER caused this change — a message, an @ask      -> go to the bottom
+//   "poll"  anything the user did not initiate — a tick, a step,
+//           streaming narration, a beat line arriving             -> keep their place,
+//                                                                    unless they were
+//                                                                    already at the bottom
 //
-// And it must not fight the user: each pass remembers where it left the scroller, and
-// stops the moment that value has moved — i.e. as soon as a human has scrolled at all.
-let _landedAt = -1;
-function landThreadAtBottom() {
-  _landedAt = -1;
+// The unifying principle: PRESERVE THE SCROLL ONLY FOR CHANGES THE USER DID NOT INITIATE.
+// The original code preserved it for everything, and got it wrong three separate times —
+// a reload landed at the top of a months-long thread, sending a message landed you halfway
+// up it, and before that the pane flickered on every 4s tick.
+//
+// It was wrong because it was INFERRING the case from a scroll measurement taken just
+// before the repaint — against a layout the repaint is about to invalidate. Sending is the
+// clearest example: the thread has just grown by your own message, and the composer has
+// collapsed from three lines back to one, so the offset that was correct a millisecond ago
+// now points into the middle of the history. Hence an explicit `reason`, not a heuristic.
+const NEAR_BOTTOM_PX = 80;
+
+function threadEl(scope) {
+  const root = scope || document;
+  return root.querySelector("#chat-thread") || root.querySelector(".chat-thread");
+}
+
+function scrollThread() {
+  const t = threadEl();
+  if (t) t.scrollTop = t.scrollHeight;
+}
+
+// Put the thread at the bottom and KEEP it there while the layout settles.
+//
+// One jump is not enough and never was: at the moment a render returns, the thread's
+// scrollHeight is still ~0, so setting scrollTop silently does nothing — that is exactly
+// how the first attempt at this became a no-op. The height also keeps moving afterwards:
+// the composer's textarea collapses, a tall beat block gets appended, hydrated steps and
+// assistant activity land from their own fetches. So: now, next frame, and twice more.
+//
+// It must never fight a human, so it stops the moment the SAME element has moved under it.
+// A DIFFERENT element (a full render happened in between) is not a user gesture and is
+// still pinned — otherwise a re-render would cancel the pin it was supposed to complete.
+let _pinToken = 0;
+function cancelThreadPin() { _pinToken++; }
+
+function pinThreadToBottom() {
+  const token = ++_pinToken;
+  let landedEl = null;
+  let landedAt = -1;
   const jump = () => {
-    const t = document.getElementById("chat-thread");
+    if (token !== _pinToken) return;                       // superseded or cancelled
+    const t = threadEl();
     if (!t) return;
-    if (_landedAt >= 0 && Math.abs(t.scrollTop - _landedAt) > 2) return;  // the reader moved
+    if (t === landedEl && Math.abs(t.scrollTop - landedAt) > 2) return;   // the reader moved
     t.scrollTop = t.scrollHeight;
-    _landedAt = t.scrollTop;
+    landedEl = t;
+    landedAt = t.scrollTop;
   };
+  jump();                                    // in case the layout is already settled
   requestAnimationFrame(() => { jump(); requestAnimationFrame(jump); });
   setTimeout(jump, 150);
   setTimeout(jump, 600);
@@ -1433,19 +1477,29 @@ function leftSignature() {
 }
 
 let _leftSig = null;
-function repaintLeft() {
+// `reason` is one of the three cases in THE SCROLL POLICY above. It defaults to "poll"
+// because a background tick is by far the most common caller — and because defaulting to
+// "preserve" is the safe direction: the worst it can do is leave a reader where they were.
+function repaintLeft(reason) {
   const old = document.querySelector(".split > .left");
   if (!old) { render(); return; }
+  const userDriven = reason === "send" || reason === "open";
   const sig = leftSignature();
-  if (sig === _leftSig) return;               // nothing new — leave the DOM (and the scroll) alone
+  // The anti-flicker gate applies to BACKGROUND repaints only. A user who just pressed
+  // Send is owed a paint even when the signature happens not to move (sending the same
+  // text twice, or an @ask whose only visible effect is the beat that follows).
+  if (!userDriven && sig === _leftSig) return;  // nothing new — leave the DOM (and the scroll) alone
   _leftSig = sig;
 
-  // Preserve the reader's place: only auto-scroll if they were already at the bottom.
+  // Where the reader was, for case 3 only. Deliberately NOT consulted for "send"/"open":
+  // this measurement is taken against a layout the repaint is about to invalidate, and
+  // trusting it is what put a freshly-sent message halfway up the thread.
   // The scroller is `.chat-thread` (id `chat-thread`) — the earlier `.thread`/`.scroll`
   // selectors matched NOTHING, so `sc` was always null, `wasNearBottom` always true, and
   // every repaint still yanked the reader to the bottom. Use the real element.
-  const sc = old.querySelector("#chat-thread") || old.querySelector(".chat-thread");
-  const wasNearBottom = !sc || (sc.scrollHeight - sc.scrollTop - sc.clientHeight) < 80;
+  const sc = threadEl(old);
+  const wasNearBottom = !sc
+    || (sc.scrollHeight - sc.scrollTop - sc.clientHeight) < NEAR_BOTTOM_PX;
   const prevTop = sc ? sc.scrollTop : 0;
 
   // The composer goes with the pane (see captureComposerFocus).
@@ -1454,11 +1508,21 @@ function repaintLeft() {
   old.replaceWith(leftPanel());
   restoreComposerFocus(cap);
 
-  const next = document.querySelector(".split > .left #chat-thread")
-    || document.querySelector(".split > .left .chat-thread");
+  // CASES 1 + 2 — the user did this; put them at the newest message and hold it there
+  // while the composer collapses and the reply starts arriving.
+  if (userDriven) { pinThreadToBottom(); return; }
+
+  // CASE 3 — a background change.
+  const next = threadEl(document.querySelector(".split > .left"));
   if (next) {
-    if (wasNearBottom) scrollThread();
-    else next.scrollTop = prevTop;            // reading history? stay put
+    if (wasNearBottom) {
+      pinThreadToBottom();                    // following along: come down with the content
+    } else {
+      // Reading history: stay put — and cancel any pin still in flight from an earlier
+      // send, or it would find this brand-new element and drag the reader back down.
+      cancelThreadPin();
+      next.scrollTop = prevTop;
+    }
   }
 }
 
@@ -1604,7 +1668,7 @@ async function loadTab(tab, { force = false } = {}) {
   // keeps the picker honest after a start/delete without a second round trip.
   if (tab === "assistants" && next.data) {
     state.asstRoster = next.data.assistants || [];
-    repaintLeft();          // the composer hint counts them (and is in leftSignature)
+    repaintLeft("poll");    // the composer hint counts them (and is in leftSignature)
   }
   if (state.tab === tab) repaintRight();
 }
@@ -2825,6 +2889,11 @@ async function sendMessage(text) {
 
   setComposerText("", { focus: false });
   pushMessage("user", { text });          // one thread: the ask reads like any message
+  // CASE 2 of the scroll policy: the user caused this, so they must SEE their words land.
+  // Before every branch below, because all three of them (@ask, update, create) are the
+  // same event to a reader — and pinned rather than jumped once, because the composer
+  // collapsing back to one line changes the thread's height a frame later.
+  repaintLeft("send");
   if (m) { askAssistant(m.assistant, m.task); return; }
   if (state.project) onUpdate(text);
   else onCreate(text);
@@ -2879,7 +2948,7 @@ async function refreshAssistantRoster() {
     // Anything else is transient, so leave the roster UNKNOWN and let the next send retry.
     if (e instanceof NotFoundError || (e && e.name === "NotFoundError")) state.asstRoster = [];
   }
-  repaintLeft();      // the composer hint counts the roster (and is in leftSignature)
+  repaintLeft("poll");// the composer hint counts the roster (and is in leftSignature)
 }
 
 function finalizeLiveMsg(text, kind) {
@@ -3119,12 +3188,12 @@ async function enterProject(id, { navigate = true } = {}) {
   state.runHistory = runToHistory(proj.latest_run);
   state.hydrating = false;
   render();
-  // Opening a project lands on the NEWEST message, like any chat client. This is the one
-  // paint where repaintLeft()'s preserve-the-reader's-place rule is wrong (see
-  // landThreadAtBottom): messages and steps have just been restored from the server and
-  // nobody has read anything yet, so the top of a months-long thread is the worst possible
-  // place to be put. Called after render() so the content exists to scroll past.
-  landThreadAtBottom();
+  // CASE 1 of the scroll policy: opening a project lands on the NEWEST message, like any
+  // chat client. Messages and steps have just been restored from the server and nobody has
+  // read anything yet, so the top of a months-long thread is the worst place to be put.
+  // After render(), and pinned, because the steps and the assistant activity arrive from
+  // their own fetches a moment later and change the height again.
+  pinThreadToBottom();
 
   // The executed step list is NOT allowed to depend on the project row carrying
   // latest_run.steps. If it didn't, ask the dedicated endpoint and paint them in.
@@ -3154,7 +3223,7 @@ async function backfillSteps(id) {
   const base = state.project.latest_run || {};
   state.runHistory = runToHistory({ kind: base.kind, request: base.request,
                                     status: base.status, steps: sr.steps });
-  repaintLeft();
+  repaintLeft("poll");   // steps that arrived from their own fetch, not from the user
 }
 
 // Rebuild the conversation. Server `messages` is the authority; sessionStorage is
@@ -3257,7 +3326,7 @@ function maybeResumeRun() {
       }
       lastDone = doneCount;
     }
-    repaintLeft();              // still running: only the step list changes
+    repaintLeft("poll");        // still running: only the step list changes
   }, 4000);
 }
 
@@ -3329,7 +3398,7 @@ async function refreshAssistantActivity() {
     if (!state.project || state.project.id !== proj.id) return;
     state.assistantActivity = (feed && Array.isArray(feed.beats)) ? feed : null;
     activityMisses = 0;
-    repaintLeft();     // gated by leftSignature(): a no-op poll paints nothing
+    repaintLeft("poll");// gated by leftSignature(): a no-op poll paints nothing
   } catch (e) {
     if (e instanceof NotFoundError || (e && e.name === "NotFoundError")) activityAbsent = true;
     else activityMisses++;      // transient: the next tick falls back to the idle cadence
