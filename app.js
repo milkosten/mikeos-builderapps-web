@@ -1655,10 +1655,14 @@ document.addEventListener("click", () => {
 const TAB_FETCH = {
   goals:       (id) => api.projectDocs(id),
   assistants:  (id) => api.assistants(id),
-  // The board is fetched WHOLE and filtered client-side. It is a few hundred rows at most,
-  // and filtering locally is what keeps the status pills instant instead of costing a round
-  // trip each — the server-side filters exist for the API's other clients (`ws`, scripts).
-  workspace:   (id) => api.workspaceItems(id),
+  // The board is fetched WHOLE and filtered client-side, so the chips and the search are
+  // instant instead of costing a round trip each — the server-side filters exist for the
+  // API's other clients (`ws`, scripts). `limit` is passed EXPLICITLY at the server's
+  // maximum: the default is 200, and a board past that would have silently shown a header
+  // count (computed over every row) that disagreed with the list, while the rows actually
+  // missing were the NEWEST ones. `summary` renders `counts.total` so the two can never
+  // disagree, and says so when the list is short of it.
+  workspace:   (id) => api.workspaceItems(id, { limit: 500 }),
   code:        (id) => api.projectFiles(id, state.codePath || ""),
   database:    (id) => api.projectDatabase(id),
   secrets:     (id) => api.projectSecrets(id, state.secretsRevealed),
@@ -2247,13 +2251,23 @@ function workspaceTab() {
     const bar = tabToolbar(
       el("button", { class: "btn primary sm", onclick: () => { state.wsDialog = {}; repaintRight(); } },
         "＋ New item"),
+      // Filtering repaints the panel, which destroys and rebuilds this input — so the caret
+      // has to be put back EXACTLY where it was, not at the end. Slamming it to
+      // `value.length` made mid-string editing impossible: click after "rate", type "s",
+      // and the next character lands at the tail instead. `isComposing` skips the repaint
+      // entirely mid-IME, because tearing the node down during composition (CJK, dead keys)
+      // loses the composition.
       el("input", {
         class: "ws-search", type: "search", placeholder: "Search the board…",
         value: state.wsQuery || "",
-        oninput: (e) => { state.wsQuery = e.target.value; repaintRight();
-                          // keep the caret where the user left it after the repaint
-                          const n = document.querySelector(".ws-search");
-                          if (n) { n.focus(); n.setSelectionRange(n.value.length, n.value.length); } },
+        oninput: (e) => {
+          state.wsQuery = e.target.value;
+          if (e.isComposing) return;
+          const at = e.target.selectionStart;
+          repaintRight();
+          const n = document.querySelector(".ws-search");
+          if (n) { n.focus(); try { n.setSelectionRange(at, at); } catch { /* type=search */ } }
+        },
       }),
       el("div", { class: "spacer" }),
       el("select", {
@@ -2275,10 +2289,18 @@ function workspaceTab() {
         state.wsDialog ? wsDialog(kinds, statuses) : null);
     }
 
+    // Counts come from the SERVER's totals (computed over every row), and the kind chips use
+    // the same source — so the header and the chips can never disagree with each other. If
+    // the fetch was capped, say so rather than quietly showing a smaller board than the
+    // numbers claim.
+    const total = (counts.total != null) ? counts.total : all.length;
     const summary = el("div", { class: "ws-summary" },
-      el("span", {}, `${all.length} item${all.length === 1 ? "" : "s"}`),
-      el("span", { class: "ws-sum-done" }, `${done} done`),
+      el("span", {}, `${total} item${total === 1 ? "" : "s"}`),
+      el("span", { class: "ws-sum-done" },
+        `${(counts.by_status && counts.by_status.done) || done} done`),
       blocked ? el("span", { class: "ws-sum-blocked" }, `${blocked} blocked`) : null,
+      all.length < total
+        ? el("span", { class: "ws-sum-hint" }, `showing the first ${all.length}`) : null,
       el("span", { class: "ws-sum-hint" },
         "filed by the pipeline, your assistants and you"));
 
@@ -2303,15 +2325,15 @@ function workspaceTab() {
     }
 
     // Grouped by kind — the user's mental model is "features / bugs / docs", not one flat
-    // list sorted by id.
+    // list sorted by id. `kinds` is the union of the server's vocabulary AND every kind
+    // present in `all`, so iterating it cannot drop a row: that union IS the safety net,
+    // and a second "belt and braces" pass over unlisted kinds was unreachable code
+    // pretending to be one. If `kinds` is ever narrowed to just `data.kinds`, THIS is the
+    // line that has to grow a fallback.
     const groups = [];
     for (const k of kinds) {
       const inKind = rows.filter((i) => i.kind === k);
       if (inKind.length) groups.push([k, inKind]);
-    }
-    for (const i of rows) if (!kinds.includes(i.kind)) {   // belt and braces
-      const g = groups.find(([k]) => k === i.kind);
-      if (g) g[1].push(i); else groups.push([i.kind, [i]]);
     }
 
     const board = el("div", { class: "ws-board" });
@@ -2349,8 +2371,16 @@ function wsDetailPane() {
     tabError(d.error, () => loadWsItem(d.id, { force: true })));
   const it = d.data || {};
 
+  // THE SAME RULE AS THE BOARD, and the place it is easiest to break: the statuses offered
+  // here come from the SERVER (defaults ∪ everything that actually exists on this board),
+  // not from a list written into this file. Hardcoding the five conventional statuses would
+  // re-impose an enum at the one screen where a human actually changes a status — so an
+  // assistant could file something `needs_review` and nobody could ever put a second item
+  // there. The board's payload is already in the tab cache; read it rather than refetch.
+  const board = (state.tabs.workspace && state.tabs.workspace.data) || {};
   const statuses = Array.from(new Set([
-    "open", "in_progress", "blocked", "done", "rejected", it.status].filter(Boolean)));
+    ...(board.statuses || ["open", "in_progress", "blocked", "done", "rejected"]),
+    it.status].filter(Boolean)));
 
   const head = el("div", { class: "ws-detail-head" },
     el("div", { class: "ws-detail-title" },
@@ -2398,12 +2428,19 @@ function wsDetailPane() {
           el("article", { class: "md", html: mdToHtml(c.body_md || "") })))
       : el("div", { class: "muted-note" }, "No comments yet."));
 
+  // A TEXTAREA'S TEXT IS NOT AN ATTRIBUTE. `el()` assigns unknown keys with
+  // `setAttribute`, and `<textarea value="…">` does nothing at all — so passing the draft
+  // through `el()` rendered an EMPTY box after every repaint while `state.wsDraft` still
+  // held the text, and the next keystroke overwrote the draft with just that keystroke.
+  // The text was not hidden, it was destroyed. Set the property, after construction.
+  const commentBox = el("textarea", {
+    class: "ws-comment-box", rows: 3, placeholder: "Add a comment…",
+    oninput: (e) => { state.wsDraft = e.target.value; },   // NO repaint: it would steal focus
+  });
+  commentBox.value = state.wsDraft || "";
+
   const composer = el("div", { class: "ws-composer" },
-    el("textarea", {
-      class: "ws-comment-box", rows: 3, placeholder: "Add a comment…",
-      value: state.wsDraft || "",
-      oninput: (e) => { state.wsDraft = e.target.value; },   // NO repaint: it would steal focus
-    }),
+    commentBox,
     el("button", {
       class: "btn primary sm", disabled: state.wsBusy,
       onclick: () => wsComment(it.id),
@@ -2429,17 +2466,34 @@ function wsDetailPane() {
 }
 
 // ----- "+ New item" -----
+// EVERY FIELD IS BACKED BY `state.wsDialog`, exactly as the assistant dialog backs its own
+// (`state.asstDialog`). The fields used to live only in the live DOM nodes, and this pane is
+// repainted by things the user never triggers — `wsCreate` repaints twice around its POST,
+// and the 4s run poller drops the tab cache and reloads. So a user could write five
+// paragraphs of detail, hit Create, get a 422, and find the modal still open and completely
+// blank with no way back. Typed text belongs in state; the DOM is just a view of it.
 function wsDialog(kinds, statuses) {
-  const kindSel = el("select", { class: "ws-filter" },
+  const d = state.wsDialog;
+  if (d.kind === undefined) d.kind = "task";
+  if (d.status === undefined) d.status = "open";
+  if (d.title === undefined) d.title = "";
+  if (d.body === undefined) d.body = "";
+
+  const kindSel = el("select", { class: "ws-filter",
+                                 onchange: (e) => { d.kind = e.target.value; } },
     (kinds && kinds.length ? kinds : ["feature", "bug", "task", "testcase", "doc", "kb"])
-      .map((k) => el("option", { value: k, selected: k === "task" }, k)));
-  const titleIn = el("input", { class: "ws-input", type: "text",
-                                placeholder: "What is it? One line." });
+      .map((k) => el("option", { value: k, selected: k === d.kind }, k)));
+  const titleIn = el("input", { class: "ws-input", type: "text", value: d.title,
+                                placeholder: "What is it? One line.",
+                                oninput: (e) => { d.title = e.target.value; } });
   const bodyIn = el("textarea", { class: "ws-input", rows: 5,
-                                  placeholder: "The details someone else could act on (Markdown)." });
-  const statusSel = el("select", { class: "ws-filter" },
+                                  placeholder: "The details someone else could act on (Markdown).",
+                                  oninput: (e) => { d.body = e.target.value; } });
+  bodyIn.value = d.body;      // a textarea's text is a child/property, never an attribute
+  const statusSel = el("select", { class: "ws-filter",
+                                   onchange: (e) => { d.status = e.target.value; } },
     (statuses && statuses.length ? statuses : ["open", "in_progress", "blocked", "done"])
-      .map((s) => el("option", { value: s, selected: s === "open" }, s.replace(/_/g, " "))));
+      .map((s) => el("option", { value: s, selected: s === d.status }, s.replace(/_/g, " "))));
 
   // The same modal chrome the "+ Start an assistant" dialog uses (`asst-modal*`) — one
   // dialog style in this app, not two that drift apart.
@@ -2461,10 +2515,9 @@ function wsDialog(kinds, statuses) {
         el("button", {
           class: "btn primary sm", disabled: state.wsBusy,
           onclick: () => {
-            const title = titleIn.value.trim();
+            const title = (d.title || "").trim();
             if (!title) { toast("A title is required", "err"); return; }
-            wsCreate({ kind: kindSel.value, title, body_md: bodyIn.value,
-                       status: statusSel.value });
+            wsCreate({ kind: d.kind, title, body_md: d.body, status: d.status });
           },
         }, state.wsBusy ? "Saving…" : "Create"))));
 }
