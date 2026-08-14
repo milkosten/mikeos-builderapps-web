@@ -70,10 +70,16 @@ a { color: var(--accent); }
 
 /* ---------- left panel as a chat ---------- */
 .left.chat { height: 100%; display: flex; flex-direction: column; min-height: 0; }
+/* NOTE the absence of `scroll-behavior: smooth`. It does NOT affect the user's own
+   wheel/touch scrolling — only PROGRAMMATIC scrolls — so all it ever did here was animate
+   ours, and every one of them became a visible slide down the thread ("the whole left pane
+   starts to scroll 50% or more"). Worse, an animated scrollTop reads back its OLD value on
+   the same tick, so the scroll-restore logic was comparing against a position the browser
+   was still travelling towards, and the "has the reader moved?" check misfired on its own
+   animation. Programmatic scrolling here is instant, deliberately. */
 .chat-thread {
   flex: 1; min-height: 0; overflow-y: auto;
   padding: 18px 16px 8px; display: flex; flex-direction: column; gap: 14px;
-  scroll-behavior: smooth;
 }
 
 /* message rows */

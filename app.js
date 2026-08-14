@@ -1314,9 +1314,22 @@ function threadEl(scope) {
   return root.querySelector("#chat-thread") || root.querySelector(".chat-thread");
 }
 
+// Every programmatic scroll in this file goes through here, and every one of them is
+// INSTANT. `.chat-thread` used to carry `scroll-behavior: smooth`, which turned each of
+// our repositionings into a visible slide down the thread — and made `scrollTop` read back
+// its pre-animation value on the same tick, so the "did the reader move?" checks below
+// were comparing against a position the browser was still travelling towards. The CSS is
+// gone; `behavior: "instant"` is the belt to that braces, since a parent rule could
+// reintroduce it.
+function scrollTo(el, top) {
+  if (!el) return;
+  try { el.scrollTo({ top, behavior: "instant" }); }
+  catch { el.scrollTop = top; }               // older engines: no options object
+}
+
 function scrollThread() {
   const t = threadEl();
-  if (t) t.scrollTop = t.scrollHeight;
+  if (t) scrollTo(t, t.scrollHeight);
 }
 
 // Put the thread at the bottom and KEEP it there while the layout settles.
@@ -1342,7 +1355,7 @@ function pinThreadToBottom() {
     const t = threadEl();
     if (!t) return;
     if (t === landedEl && Math.abs(t.scrollTop - landedAt) > 2) return;   // the reader moved
-    t.scrollTop = t.scrollHeight;
+    scrollTo(t, t.scrollHeight);
     landedEl = t;
     landedAt = t.scrollTop;
   };
@@ -1516,7 +1529,7 @@ function repaintLeft(reason) {
       // Reading history: stay put — and cancel any pin still in flight from an earlier
       // send, or it would find this brand-new element and drag the reader back down.
       cancelThreadPin();
-      next.scrollTop = prevTop;
+      scrollTo(next, prevTop);
     }
   }
 }
@@ -1982,7 +1995,7 @@ function logsTab() {
     // newest line at the bottom -> park the scroll there
     setTimeout(() => {
       const sc = document.querySelector(".right-body .tab-pane");
-      if (sc) sc.scrollTop = sc.scrollHeight;
+      if (sc) scrollTo(sc, sc.scrollHeight);
     }, 0);
     return tabPane(bar, pre);
   });
