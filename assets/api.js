@@ -132,6 +132,7 @@ const live = {
   projectDatabase:    (id)     => sub(id, "database"),
   projectSecrets:     (id, reveal) => sub(id, "secrets" + (reveal ? "?reveal=1" : "")),
   projectLogs:        (id, tail)   => sub(id, `logs?tail=${encodeURIComponent(tail || 200)}`),
+  projectUsage:       (id)     => sub(id, "usage"),
   projectCommits:     (id)     => sub(id, "commits"),
   projectDeployments: (id)     => sub(id, "deployments"),
   projectQa:          (id)     => sub(id, "qa"),

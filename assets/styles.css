@@ -660,7 +660,10 @@ a.btn { text-decoration: none; }
 
 .wtab-plus-wrap { position: relative; flex: 0 0 auto; }
 .wtab-menu {
-  position: absolute; top: calc(100% + 6px); right: 0; z-index: 40;
+  /* Positioned as `fixed` from JS (see app.js): the tab bar is an overflow-x scroller,
+     which per CSS forces overflow-y to auto and CLIPPED this menu so it never appeared.
+     z-index sits above the rail (10) and right-head, below toasts (50). */
+  position: fixed; z-index: 45;
   min-width: 190px; padding: 5px;
   background: var(--panel); border: 1px solid var(--border-2);
   border-radius: var(--radius); box-shadow: var(--shadow);
@@ -889,3 +892,16 @@ a.btn { text-decoration: none; }
   .kv-key { flex-basis: 130px; }
 }
 .run-head .run-req { font-style: italic; color: var(--text-mute); }
+
+/* ---- Usage & Cost tab ---- */
+.usage-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.usage-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 4px;
+}
+.uc-label { font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-mute); }
+.uc-value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.uc-sub { font-size: 12px; color: var(--text-mute); }
+.tbl .num, .usage-card .uc-value { font-variant-numeric: tabular-nums; }
+.tbl td.num, .tbl th.num { text-align: right; }
+.muted-note { font-size: 12.5px; color: var(--text-mute); }

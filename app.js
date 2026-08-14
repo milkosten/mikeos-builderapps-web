@@ -3,6 +3,7 @@
 import { auth } from "/assets/auth.js";
 import { api, isMock, AuthError, NotFoundError } from "/assets/api.js";
 
+const APP_BASE = "builderapps.osmike.com";
 const CFG = window.BUILDERAPPS_CONFIG;
 const root = document.getElementById("root");
 
@@ -138,6 +139,18 @@ function compactMessages() {
 // The thread's SOURCE OF TRUTH is the server: PUT /api/projects/{id}/messages,
 // read back from GET /api/projects/{id} on load. sessionStorage is kept ONLY as an
 // offline fallback for when that endpoint is unreachable — never as the authority.
+// The API stores `subdomain` as the FULL host ("abc123.builderapps.osmike.com"), so the old
+// `https://${subdomain}.builderapps.osmike.com/` fallback produced a DOUBLED domain
+// ("abc123.builderapps.osmike.com.builderapps.osmike.com") — which has no certificate and
+// fails with ERR_SSL_PROTOCOL_ERROR, making a healthy app look dead. Build it in one place.
+function appUrl(p) {
+  if (!p) return "";
+  if (p.url) return p.url;
+  const host = String(p.subdomain || "").trim();
+  if (host.includes(".")) return `https://${host}/`;      // already a full host
+  return `https://${host || p.id}.${APP_BASE}/`;
+}
+
 function threadKey(id) { return "builderapps_thread_" + id; }
 
 let msgSaveTimer = null;
@@ -491,7 +504,7 @@ function appsView() {
     list.appendChild(el("div", { class: "empty" }, "No apps yet — build your first one."));
   } else {
     for (const p of state.projects) {
-      const url = p.url || `https://${p.subdomain || p.id}.builderapps.osmike.com/`;
+      const url = p.url || appUrl(p);
       list.appendChild(el("div", { class: "app-card", role: "button", title: "Open in the builder",
         onclick: () => openProject(p.id) },
         el("div", { class: "app-card-main" },
@@ -837,6 +850,7 @@ const TABS = {
   database:    { label: "Database",     pinned: true,  icon: "▤" },
   secrets:     { label: "Secrets",      pinned: true,  icon: "🔑" },
   logs:        { label: "Logs",         pinned: true,  icon: "≡" },
+  usage:       { label: "Usage & Cost" },
   commits:     { label: "Commits" },
   deployments: { label: "Deployments" },
   qa:          { label: "QA & Tests" },
@@ -874,11 +888,44 @@ function repaintRight() {
 
 // Repaint ONLY the chat side — used by the run poller so a 4s tick never reloads
 // the live-preview iframe underneath the user.
+// A signature of everything the left panel actually renders. The run poller ticks every
+// 4s whether or not anything changed; repainting on every tick made the panel visibly
+// "flip" and yanked the reader back to the bottom mid-sentence. Repaint only when this
+// changes — i.e. only when there is genuinely something new to show.
+function leftSignature() {
+  try {
+    return JSON.stringify({
+      p: state.project && state.project.id,
+      s: state.project && state.project.status,
+      g: state.generating,
+      m: (state.messages || []).map((m) => [m.role, m.text, m.kind,
+        (m.steps || []).map((s) => s.name + ":" + s.status + ":" + (s.log || "").length)]),
+      r: (state.runHistory || []).map((s) => s.name + ":" + s.status),
+    });
+  } catch { return String(Math.random()); }   // never suppress a paint on an error
+}
+
+let _leftSig = null;
 function repaintLeft() {
   const old = document.querySelector(".split > .left");
   if (!old) { render(); return; }
+  const sig = leftSignature();
+  if (sig === _leftSig) return;               // nothing new — leave the DOM (and the scroll) alone
+  _leftSig = sig;
+
+  // Preserve the reader's place: only auto-scroll if they were already at the bottom.
+  const sc = old.querySelector(".thread") || old.querySelector(".scroll");
+  const wasNearBottom = !sc || (sc.scrollHeight - sc.scrollTop - sc.clientHeight) < 80;
+  const prevTop = sc ? sc.scrollTop : 0;
+
   old.replaceWith(leftPanel());
-  scrollThread();
+
+  const next = document.querySelector(".split > .left .thread")
+    || document.querySelector(".split > .left .scroll");
+  if (next) {
+    if (wasNearBottom) scrollThread();
+    else next.scrollTop = prevTop;            // reading history? stay put
+  }
 }
 
 function selectTab(id) {
@@ -948,6 +995,23 @@ function tabBar() {
       menu.appendChild(el("button", { class: "wtab-menu-item",
         onclick: () => openExtraTab(id) }, TABS[id].label));
     }
+    // The tab bar is a horizontal scroller (overflow-x: auto). Per CSS, once one axis is
+    // non-visible the other computes to auto too, so an absolutely-positioned drop-down is
+    // CLIPPED by the bar — the menu opened but was invisible. Anchor it to the viewport
+    // instead and position it from the button's rect, so nothing can clip it.
+    menu.style.position = "fixed";
+    menu.style.visibility = "hidden";          // measure before showing, avoids a flash
+    requestAnimationFrame(() => {
+      const b = plus.querySelector(".wtab.plus");
+      if (!b || !menu.isConnected) return;
+      const r = b.getBoundingClientRect();
+      const w = menu.offsetWidth || 200;
+      const left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8));
+      menu.style.left = left + "px";
+      menu.style.top = (r.bottom + 6) + "px";
+      menu.style.maxHeight = Math.max(140, window.innerHeight - r.bottom - 24) + "px";
+      menu.style.visibility = "visible";
+    });
     plus.appendChild(menu);
   }
   bar.appendChild(plus);
@@ -969,6 +1033,7 @@ const TAB_FETCH = {
   database:    (id) => api.projectDatabase(id),
   secrets:     (id) => api.projectSecrets(id, state.secretsRevealed),
   logs:        (id) => api.projectLogs(id, 200),
+  usage:       (id) => api.projectUsage(id),
   commits:     (id) => api.projectCommits(id),
   deployments: (id) => api.projectDeployments(id),
   qa:          (id) => api.projectQa(id),
@@ -1083,6 +1148,7 @@ function tabBody(tab) {
     case "database":    return databaseTab();
     case "secrets":     return secretsTab();
     case "logs":        return logsTab();
+    case "usage":       return usageTab();
     case "commits":     return commitsTab();
     case "deployments": return deploymentsTab();
     case "qa":          return qaTab();
@@ -1322,6 +1388,42 @@ function logsTab() {
 }
 
 // ----- the remaining list-shaped tabs -----
+// ---- Usage & Cost -------------------------------------------------------------
+// Token accounting for this project. OpenRouter reports REAL cost when available; a row
+// is flagged as estimated only when the provider didn't return one.
+function usageTab() {
+  const d = state.tabs.usage && state.tabs.usage.data;
+  if (!d || !d.totals) return tabEmpty("No LLM usage recorded yet — it appears as the build runs.");
+  const t = d.totals;
+  const n = (x) => Number(x || 0).toLocaleString();
+  const usd = (x) => "$" + Number(x || 0).toFixed(4);
+  const cards = el("div", { class: "usage-cards" },
+    usageCard("Input tokens", n(t.prompt_tokens), t.cached_tokens ? n(t.cached_tokens) + " cached" : ""),
+    usageCard("Output tokens", n(t.completion_tokens), ""),
+    usageCard("Total tokens", n(t.total_tokens), n(t.calls) + " calls"),
+    usageCard("Cost", usd(t.cost_usd), t.cost_estimated ? "estimated" : "billed by provider"));
+  const rows = (d.by_step || []).map((r) => el("tr", {},
+    el("td", {}, r.step),
+    el("td", { class: "num" }, n(r.prompt_tokens)),
+    el("td", { class: "num" }, n(r.completion_tokens)),
+    el("td", { class: "num" }, n(r.cached_tokens)),
+    el("td", { class: "num" }, usd(r.cost_usd))));
+  const table = el("div", { class: "tbl-wrap" }, el("table", { class: "tbl" },
+    el("thead", {}, el("tr", {}, el("th", {}, "Step"), el("th", { class: "num" }, "In"),
+      el("th", { class: "num" }, "Out"), el("th", { class: "num" }, "Cached"),
+      el("th", { class: "num" }, "Cost"))),
+    el("tbody", {}, ...rows)));
+  return el("div", { class: "tab-pane" }, cards,
+    el("div", { class: "muted-note" }, "Model: " + (t.model || "—")), table);
+}
+
+function usageCard(label, value, sub) {
+  return el("div", { class: "usage-card" },
+    el("div", { class: "uc-label" }, label),
+    el("div", { class: "uc-value" }, value),
+    sub ? el("div", { class: "uc-sub" }, sub) : null);
+}
+
 function commitsTab() {
   return withTab("commits", (data) => {
     const rows = data.commits || [];
@@ -1483,7 +1585,7 @@ function dangerTab() {
 }
 
 function urlPill(proj) {
-  const url = proj.url || `https://${proj.subdomain || proj.id}.builderapps.osmike.com/`;
+  const url = proj.url || appUrl(proj);
   return el("div", { class: "url-pill", title: url },
     isMock() ? el("span", {}, url) : el("a", { href: url, target: "_blank", rel: "noopener" }, url));
 }
@@ -1491,7 +1593,7 @@ function urlPill(proj) {
 // Live preview of the deployed app. Reloads (via a nonce) as deploys land. In mock mode
 // there is no real host, so show a friendly placeholder frame instead of a 502.
 function previewIframe(proj) {
-  const url = proj.url || `https://${proj.subdomain || proj.id}.builderapps.osmike.com/`;
+  const url = proj.url || appUrl(proj);
   const frame = el("iframe", { class: "preview-frame", title: "Live app preview",
     sandbox: "allow-scripts allow-forms allow-popups allow-same-origin" });
   if (isMock()) {
@@ -1559,7 +1661,7 @@ function makeStreamHandler() {
       case "created": {
         // First event: gives id + the live app URL. Adopt a project shell immediately
         // so the preview iframe + status pill light up.
-        const url = evt.url || (evt.id ? `https://${evt.id}.builderapps.osmike.com/` : null);
+        const url = evt.url || (evt.id ? appUrl({ id: evt.id }) : null);
         state.live.url = url;
         if (!state.project && evt.id) {
           state.project = { id: evt.id, title: currentTitle(), status: "creating",
@@ -1697,7 +1799,7 @@ async function onUpdate(request) {
 // synthesizing the URL if the row omitted it.
 function adoptProject(proj) {
   if (!proj) return;
-  if (!proj.url) proj.url = `https://${proj.subdomain || proj.id}.builderapps.osmike.com/`;
+  if (!proj.url) proj.url = appUrl(proj);
   state.project = proj;
 }
 
