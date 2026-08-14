@@ -1007,7 +1007,7 @@ function cellText(v) {
   if (v == null || v === "") return "—";
   if (typeof v === "string") return v;
   if (typeof v === "number" || typeof v === "boolean") return String(v);
-  if (Array.isArray(v)) return v.map(cellText).join(", ");
+  if (Array.isArray(v)) return v.length ? v.map(cellText).join(", ") : "—";
   try { const s = JSON.stringify(v); return s.length > 160 ? s.slice(0, 157) + "…" : s; }
   catch { return "—"; }
 }
@@ -1140,6 +1140,9 @@ function fmtBytes(n) {
   return (n / 1048576).toFixed(1) + " MB";
 }
 const baseName = (p) => String(p || "").replace(/\/+$/, "").split("/").pop() || p;
+// Several endpoints report memory as a raw byte count; show it human-readable but
+// pass anything already formatted (e.g. "48 MiB") straight through.
+const maybeBytes = (v) => (typeof v === "number" && isFinite(v) ? fmtBytes(v) : cellText(v));
 
 function codeTab() {
   return withTab("code", (data) => {
@@ -1373,6 +1376,8 @@ function metricsTab() {
     return tabPane(recordsTable(rows, ["name", "status", "cpu_pct", "mem_used", "mem_limit"], {
       name: (v) => el("span", { class: "mono" }, cellText(v)),
       cpu_pct: (v) => (typeof v === "number" ? v.toFixed(1) + " %" : cellText(v)),
+      mem_used: maybeBytes,
+      mem_limit: maybeBytes,
     }));
   });
 }
@@ -1382,7 +1387,7 @@ function cacheTab() {
     const stats = el("div", { class: "stat-row" },
       el("div", { class: "stat" }, el("div", { class: "stat-n" }, cellText(data.dbsize)),
         el("div", { class: "stat-l" }, "Keys")),
-      el("div", { class: "stat" }, el("div", { class: "stat-n" }, cellText(data.used_memory)),
+      el("div", { class: "stat" }, el("div", { class: "stat-n" }, maybeBytes(data.used_memory)),
         el("div", { class: "stat-l" }, "Memory used")));
     if (!keys.length) return tabPane(stats, tabEmpty("No cache keys — nothing has been cached yet."));
     const list = el("div", { class: "kv-list" });
@@ -1802,15 +1807,17 @@ function maybeResumeRun() {
     if (!state.project || state.project.id !== id || state.generating) { stopStepPolling(); return; }
     let run2 = null;
     try {
-      // Prefer the cheap steps endpoint; fall back to the full project row.
-      if (api.projectSteps) {
-        try { run2 = await api.projectSteps(id); }
-        catch (e) { if (!(e instanceof NotFoundError || (e && e.name === "NotFoundError"))) throw e; }
-      }
-      if (!run2) {
-        const fresh = await api.getProject(id);
-        adoptProject(fresh);
-        run2 = fresh.latest_run;
+      // The project row is authoritative for the run's STATUS (GET .../steps
+      // returns {run_id, steps} only), and already carries the steps too.
+      const fresh = await api.getProject(id);
+      adoptProject(fresh);
+      run2 = fresh.latest_run || null;
+      // Only reach for the dedicated steps endpoint if the row didn't carry them.
+      if (api.projectSteps && (!run2 || !(run2.steps || []).length)) {
+        try {
+          const sr = await api.projectSteps(id);
+          if (sr && sr.steps) run2 = { ...(run2 || {}), steps: sr.steps };
+        } catch (e) { if (!(e instanceof NotFoundError || (e && e.name === "NotFoundError"))) throw e; }
       }
     } catch {
       if (++misses >= 5) { stopStepPolling(); }   // stop hammering a dead endpoint
@@ -1819,7 +1826,10 @@ function maybeResumeRun() {
     misses = 0;
     if (!run2) return;
     state.runHistory = runToHistory(run2);
-    const done = run2.status && run2.status !== "running" && run2.status !== "queued";
+    const runState = run2.status ||
+      (["creating", "building", "deploying"].includes(String(state.project.status || "").toLowerCase())
+        ? "running" : "done");
+    const done = runState !== "running" && runState !== "queued";
     if (done) {
       stopStepPolling();
       try { adoptProject(await api.getProject(id)); } catch {}
