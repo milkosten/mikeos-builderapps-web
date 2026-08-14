@@ -628,9 +628,11 @@ function entryView() {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
   });
 
+  // No emoji on the button. A headless/older browser without an emoji font renders one as a
+  // tofu box, and the first thing a new user sees should not be a missing glyph.
   const discussBtn = el("button", { class: "btn entry-discuss", onclick: discuss,
     title: "Talk it through first — the AI drafts the plan and asks what it needs to know" },
-    el("span", { html: "&#128172;", style: "margin-right:6px" }), el("span", {}, "Discuss"));
+    el("span", { class: "discuss-ico" }), el("span", {}, "Discuss"));
   const sendBtn = el("button", { class: "btn primary entry-send", title: "Build it now", onclick: submit },
     el("span", {}, "Build it"), el("span", { html: "&#8594;", style: "margin-left:2px" }));
 
@@ -704,7 +706,7 @@ function draftSection() {
       onclick: () => { goDiscuss(false, d.id); enterDiscussion(d.id, { navigate: false }); } },
       el("div", { class: "draft-card-main" },
         el("div", { class: "draft-card-title" },
-          el("span", { class: "draft-ico", html: "&#128172;" }),
+          el("span", { class: "discuss-ico" }),
           el("span", {}, d.title || d.seed || d.id)),
         el("div", { class: "draft-card-sub" }, d.seed || "")),
       el("div", { class: "app-card-side" },
@@ -1104,13 +1106,13 @@ function sourceLine(s) {
   if (s.ok) {
     const words = Number(s.words || 0).toLocaleString();
     return el("div", { class: "src-line ok", title: s.title || s.url },
-      el("span", { class: "src-ico", html: "&#127760;" }),
+      el("span", { class: "src-ico globe" }),
       el("span", {}, "read "),
       el("a", { href: s.url, target: "_blank", rel: "noopener noreferrer" }, s.label || s.url),
       el("span", { class: "src-meta" }, ` (${words} word${words === "1" ? "" : "s"})`));
   }
   return el("div", { class: "src-line bad", title: s.error || "" },
-    el("span", { class: "src-ico" }, s.refused ? "🚫" : "⚠"),
+    el("span", { class: "src-ico " + (s.refused ? "blocked" : "warn") }),
     el("span", {}, (s.refused ? "refused " : "could not read ")),
     el("span", { class: "src-url" }, s.label || s.url),
     s.error ? el("span", { class: "src-meta" }, " — " + s.error) : null);
