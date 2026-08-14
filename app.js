@@ -225,7 +225,9 @@ function railItem(view, icon, label) {
 }
 
 function sideRail() {
-  const u = isMock() ? { name: "Demo user (mock)", email: "demo@osmike.com" } : (auth.user() || {});
+  const claims = isMock() ? { name: "Demo user (mock)", email: "demo@osmike.com" } : (auth.user() || {});
+  const p = state.profile || {};
+  const u = { name: p.name || claims.name, email: p.email || claims.email };
   return el("div", { class: "rail" },
     el("div", { class: "rail-brand", role: "button", title: "Home", onclick: () => goEntry() },
       el("div", { class: "logo" }, "B"),
@@ -836,7 +838,7 @@ async function loadProfile() {
   if (!t) return;
   try {
     const r = await fetch(CFG.ISSUER + "/oauth/userinfo", { headers: { Authorization: "Bearer " + t } });
-    if (r.ok) { state.profile = await r.json(); if (state.view === "profile") render(); }
+    if (r.ok) { state.profile = await r.json(); if (SHELL_VIEWS.has(state.view)) render(); }
   } catch { /* fall back to token claims */ }
 }
 
