@@ -1829,6 +1829,12 @@ function maybeResumeRun() {
 
   const id = state.project.id;
   let misses = 0;
+  // Each completed step produces new artifacts (strategy docs, migrations, files,
+  // commits). A tab opened DURING the build would otherwise keep showing the empty
+  // state it cached on first open — e.g. Goals looks permanently empty if you open it
+  // before `strategy_artifacts` finishes. Track progress and refetch the open tab
+  // whenever the pipeline advances, so panes fill in as the build produces them.
+  let lastDone = -1;
   stepPoll = setInterval(async () => {
     if (!state.project || state.project.id !== id || state.generating) { stopStepPolling(); return; }
     let run2 = null;
@@ -1865,6 +1871,16 @@ function maybeResumeRun() {
       render();                 // the run landed: refresh the preview + status pill
       toast("Build finished.", "ok");
       return;
+    }
+    // Still running. Refresh the open tab whenever another step has completed, so a
+    // pane opened mid-build (Goals/Code/Database) fills in instead of staying empty.
+    const doneCount = (run2.steps || []).filter((s) => s.status === "done").length;
+    if (doneCount !== lastDone) {
+      if (lastDone >= 0 && state.tab && state.tab !== "site") {
+        state.tabs = {};                          // drop the stale empty-state cache
+        loadTab(state.tab, { force: true }).catch(() => {});
+      }
+      lastDone = doneCount;
     }
     repaintLeft();              // still running: only the step list changes
   }, 4000);
