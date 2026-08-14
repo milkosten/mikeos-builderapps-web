@@ -25,16 +25,22 @@ const PIPELINE_STEPS = [
 const store = new Map();
 
 function seed() {
-  const id = "demo01";
-  store.set(id, {
-    id, title: "Recipe Box", status: "live", subdomain: id,
-    url: `https://${id}.builderapps.osmike.com/`,
-    pipeline: "create",
-    repo: "milkosten/app-demo01",
-    created_at: new Date(Date.now() - 864e5).toISOString(),
+  store.set("demo01", {
+    id: "demo01", title: "Recipe Box", status: "live", subdomain: "demo01",
+    url: "https://demo01.builderapps.osmike.com/",
+    pipeline: "create", repo: "milkosten/app-demo01",
+    created_at: new Date(Date.now() - 3 * 864e5).toISOString(),
     updated_at: new Date(Date.now() - 3600e3).toISOString(),
     latest_run: { kind: "create", status: "done", current_step: PIPELINE_STEPS.length,
                   total_steps: PIPELINE_STEPS.length },
+  });
+  store.set("demo02", {
+    id: "demo02", title: "URL Shortener", status: "building", subdomain: "demo02",
+    url: "https://demo02.builderapps.osmike.com/",
+    pipeline: "create", repo: "milkosten/app-demo02",
+    created_at: new Date(Date.now() - 1200e3).toISOString(),
+    updated_at: new Date(Date.now() - 120e3).toISOString(),
+    latest_run: { kind: "create", status: "running", current_step: 7, total_steps: PIPELINE_STEPS.length },
   });
 }
 seed();

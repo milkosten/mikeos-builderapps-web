@@ -10,17 +10,21 @@
 :80 {
 	encode zstd gzip
 
-	# SPA client-side routes: the app root and the OAuth callback both render the shell.
-	@spa path / /auth/callback
-	handle @spa {
-		root * /srv/spa
-		rewrite * /index.html
+	root * /srv/spa
+
+	# Serve the SPA's own real files from disk when they exist (assets, app.js,
+	# config.js, favicon, …). Everything else is a client-side route.
+	@files file
+	handle @files {
 		file_server
 	}
 
-	# Everything else (the SPA's own assets: /app.js, /config.js, /assets/*) from disk.
+	# All client-side routes fall back to the SPA shell. These are real pushState
+	# paths the app owns: /, /auth/callback, /builder, /apps, /settings, /profile,
+	# /subscription (and any future ones). A catch-all -> index.html is correct
+	# because generated project apps live on *.builderapps.osmike.com, not here.
 	handle {
-		root * /srv/spa
+		rewrite * /index.html
 		file_server
 	}
 }

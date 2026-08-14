@@ -8,6 +8,7 @@ const root = document.getElementById("root");
 
 // ---------- app state ----------
 const state = {
+  view: "entry",      // entry|apps|settings|profile|subscription (the "/" shell) | builder
   projects: [],
   project: null,      // full current project { id,title,status,subdomain,url,pipeline,latest_run }
   generating: false,
@@ -17,7 +18,53 @@ const state = {
   live: null,         // { steps:[{idx,name,status}], url, statusText }
   previewNonce: 0,    // bump to force the preview iframe to reload as deploys land
   booting: true,
+  entryDraft: "",     // the entry-screen textarea text (preserved across renders)
+  profile: null,      // userinfo from account.osmike.com (best-effort)
+  settings: loadSettings(),
 };
+
+// A prompt the user submitted while logged out is stashed here (and in sessionStorage)
+// so we can resume the build after the OAuth round-trip without losing it.
+const PENDING_KEY = "builderapps_pending_prompt";
+
+// ---------- settings (localStorage-persisted) ----------
+const SETTINGS_KEY = "builderapps_settings";
+function loadSettings() {
+  try { return { theme: "dark", reduceMotion: false, autoReload: true,
+                 ...(JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}")) }; }
+  catch { return { theme: "dark", reduceMotion: false, autoReload: true }; }
+}
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch {}
+  applyTheme();
+}
+function applyTheme() {
+  document.documentElement.setAttribute("data-theme", state.settings.theme || "dark");
+}
+
+// ---------- routing (real pushState paths) ----------
+const PATH_VIEW = { "/": "entry", "/apps": "apps", "/settings": "settings",
+                    "/profile": "profile", "/subscription": "subscription", "/builder": "builder" };
+const VIEW_PATH = { entry: "/", apps: "/apps", settings: "/settings",
+                    profile: "/profile", subscription: "/subscription", builder: "/builder" };
+// The "/" family (shell with the left rail). "builder" is the standalone workspace.
+const SHELL_VIEWS = new Set(["entry", "apps", "settings", "profile", "subscription"]);
+
+function navigate(view, { replace = false } = {}) {
+  state.view = view;
+  const path = VIEW_PATH[view] || "/";
+  const fn = replace ? "replaceState" : "pushState";
+  if (location.pathname !== path) history[fn](null, "", path);
+  render();
+}
+function goBuilder(replace) { navigate("builder", { replace: !!replace }); }
+function goEntry(replace)   { navigate("entry",   { replace: !!replace }); }
+
+// Sync the view to the current URL (back/forward, refresh, deep link).
+function syncViewFromPath() {
+  state.view = PATH_VIEW[location.pathname] || "entry";
+}
+window.addEventListener("popstate", () => { syncViewFromPath(); render(); });
 
 // mutable ref to the assistant message currently being narrated by the SSE stream
 let liveMsg = null;
@@ -156,9 +203,218 @@ function render() {
   root.innerHTML = "";
   if (state.booting) { root.appendChild(bootScreen()); return; }
   if (!isMock() && !auth.isAuthed()) { root.appendChild(loginScreen()); return; }
+  // The "/" family renders the app-shell (persistent left rail + a main view).
+  if (SHELL_VIEWS.has(state.view)) { root.appendChild(shell()); return; }
+  // "/builder" is the standalone builder workspace.
   root.appendChild(topbar());
   root.appendChild(el("div", { class: "split" }, leftPanel(), rightPanel()));
   scrollThread();
+}
+
+// ---------- app shell: persistent left rail + main area ----------
+function shell() {
+  return el("div", { class: "shell" }, sideRail(), mainArea());
+}
+
+function railItem(view, icon, label) {
+  const active = state.view === view;
+  return el("button", { class: "rail-item" + (active ? " active" : ""), title: label,
+    onclick: () => navigate(view) },
+    el("span", { class: "rail-ico", html: icon }),
+    el("span", { class: "rail-lbl" }, label));
+}
+
+function sideRail() {
+  const u = isMock() ? { name: "Demo user (mock)", email: "demo@osmike.com" } : (auth.user() || {});
+  return el("div", { class: "rail" },
+    el("div", { class: "rail-brand", role: "button", title: "Home", onclick: () => goEntry() },
+      el("div", { class: "logo" }, "B"),
+      el("span", {}, "BuilderApps")),
+    el("button", { class: "btn primary rail-new", onclick: () => { newProject(); },
+      title: "Start a new app" }, el("span", { html: "&#43;" }), el("span", {}, "Build")),
+    el("nav", { class: "rail-nav" },
+      railItem("apps", "&#9638;", "Apps"),
+      railItem("settings", "&#9881;", "Settings"),
+      railItem("profile", "&#128100;", "Profile"),
+      railItem("subscription", "&#9733;", "Subscription")),
+    el("div", { class: "rail-spacer" }),
+    el("div", { class: "rail-account" },
+      el("div", { class: "rail-acct-row", title: u.email || "" },
+        el("span", { class: "rail-avatar" }, (u.name || u.email || "U").slice(0, 1).toUpperCase()),
+        el("div", { class: "rail-acct-meta" },
+          el("div", { class: "rail-acct-name" }, u.name || "MikeOS user"),
+          u.email ? el("div", { class: "rail-acct-mail" }, u.email) : null)),
+      !isMock() && el("button", { class: "btn ghost sm block", onclick: () => auth.logout() }, "Sign out")));
+}
+
+function mainArea() {
+  switch (state.view) {
+    case "apps":         return el("div", { class: "main" }, appsView());
+    case "settings":     return el("div", { class: "main" }, settingsView());
+    case "profile":      return el("div", { class: "main" }, profileView());
+    case "subscription": return el("div", { class: "main" }, subscriptionView());
+    default:             return el("div", { class: "main main-entry" }, entryView());
+  }
+}
+
+// ----- entry (the focused hero + prompt + example chips), inside the shell main area -----
+function entryView() {
+  const ta = el("textarea", { id: "entry-prompt", class: "entry-input", rows: 3,
+    placeholder: "Describe the app you want to build…", autofocus: true });
+  ta.value = state.entryDraft || "";
+  ta.addEventListener("input", () => { state.entryDraft = ta.value; });
+
+  const submit = () => {
+    const v = ta.value.trim();
+    if (!v) return;
+    state.entryDraft = "";
+    startBuild(v);
+  };
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
+  });
+
+  const sendBtn = el("button", { class: "btn primary entry-send", title: "Build it", onclick: submit },
+    el("span", {}, "Build it"), el("span", { html: "&#8594;", style: "margin-left:2px" }));
+
+  const chips = el("div", { class: "entry-examples" });
+  for (const ex of EXAMPLE_PROMPTS) {
+    chips.appendChild(el("button", { class: "entry-chip", title: "Use this prompt",
+      onclick: () => { ta.value = ex; state.entryDraft = ex; ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length); } }, ex));
+  }
+
+  return el("div", { class: "entry-card" },
+    el("h1", { class: "entry-hero" }, "What do you want to build today?"),
+    el("p", { class: "entry-sub" }, "Describe an app and watch it get built, deployed, and live — a real Node + Postgres + Redis app on its own URL."),
+    el("div", { class: "entry-composer" }, ta, el("div", { class: "entry-actions" }, sendBtn)),
+    chips);
+}
+
+// ----- Apps: the user's real projects from GET /api/projects -----
+function appsView() {
+  const head = el("div", { class: "view-head" },
+    el("h1", {}, "Your apps"),
+    el("button", { class: "btn sm", onclick: () => newProject() }, "＋ Build a new app"));
+  const list = el("div", { class: "app-list" });
+  if (!state.projects.length) {
+    list.appendChild(el("div", { class: "empty" }, "No apps yet — build your first one."));
+  } else {
+    for (const p of state.projects) {
+      const url = p.url || `https://${p.subdomain || p.id}.builderapps.osmike.com/`;
+      list.appendChild(el("div", { class: "app-card", role: "button", title: "Open in the builder",
+        onclick: () => openProject(p.id) },
+        el("div", { class: "app-card-main" },
+          el("div", { class: "app-card-title" }, p.title || p.id),
+          el("div", { class: "app-card-sub" },
+            el("a", { href: url, target: "_blank", rel: "noopener",
+              onclick: (e) => e.stopPropagation() }, url))),
+        el("div", { class: "app-card-side" },
+          statusPill(p.status),
+          el("span", { class: "app-card-when" }, fmtDate(p.updated_at || p.created_at)))));
+    }
+  }
+  return el("div", {}, head, list);
+}
+
+// ----- Settings: theme/preferences persisted in localStorage -----
+function settingsView() {
+  const row = (label, control, hint) => el("div", { class: "set-row" },
+    el("div", { class: "set-meta" }, el("div", { class: "set-label" }, label),
+      hint ? el("div", { class: "set-hint" }, hint) : null),
+    control);
+
+  const themeSel = el("select", { class: "set-select",
+    onchange: (e) => { state.settings.theme = e.target.value; saveSettings(); render(); } });
+  for (const t of ["dark", "light"]) {
+    const o = el("option", { value: t }, t[0].toUpperCase() + t.slice(1));
+    if ((state.settings.theme || "dark") === t) o.selected = true;
+    themeSel.appendChild(o);
+  }
+
+  const rm = toggle(state.settings.reduceMotion, (v) => { state.settings.reduceMotion = v; saveSettings(); });
+  const ar = toggle(state.settings.autoReload, (v) => { state.settings.autoReload = v; saveSettings(); });
+
+  return el("div", {},
+    el("div", { class: "view-head" }, el("h1", {}, "Settings")),
+    el("div", { class: "card-panel" },
+      row("Theme", themeSel, "Switch between the dark and light appearance."),
+      row("Reduce motion", rm, "Minimise animations across the app."),
+      row("Auto-reload preview", ar, "Reload the live preview automatically as deploys land.")),
+    el("p", { class: "muted-note" }, "Preferences are saved on this device."));
+}
+
+// A small on/off toggle switch.
+function toggle(on, onChange) {
+  const input = el("input", { type: "checkbox" });
+  input.checked = !!on;
+  input.addEventListener("change", () => onChange(input.checked));
+  return el("label", { class: "switch" }, input,
+    el("span", { class: "track" }, el("span", { class: "knob" })));
+}
+
+// ----- Profile: the real signed-in identity (token claims + best-effort userinfo) -----
+function profileView() {
+  const u = isMock() ? { name: "Demo user (mock)", email: "demo@osmike.com", sub: "mock-sub" } : (auth.user() || {});
+  const p = state.profile || {};
+  const name = p.name || u.name || "MikeOS user";
+  const email = p.email || u.email || "";
+  const avatar = p.picture || p.avatar_url || null;
+  const sub = p.sub || u.sub || "";
+
+  const av = avatar
+    ? el("img", { class: "profile-avatar-img", src: avatar, alt: "", referrerpolicy: "no-referrer" })
+    : el("div", { class: "profile-avatar" }, (name || email || "U").slice(0, 1).toUpperCase());
+
+  const field = (label, value) => value ? el("div", { class: "pf-field" },
+    el("div", { class: "pf-label" }, label), el("div", { class: "pf-value" }, value)) : null;
+
+  return el("div", {},
+    el("div", { class: "view-head" }, el("h1", {}, "Profile")),
+    el("div", { class: "card-panel profile-panel" },
+      el("div", { class: "profile-top" }, av,
+        el("div", {}, el("div", { class: "profile-name" }, name),
+          email ? el("div", { class: "profile-mail" }, email) : null)),
+      el("div", { class: "pf-fields" },
+        field("Name", name),
+        field("Email", email),
+        field("Account ID", sub),
+        field("Identity provider", "account.osmike.com")),
+      !isMock() && el("button", { class: "btn sm", onclick: () => auth.logout() }, "Sign out")),
+    el("p", { class: "muted-note" }, "Your identity comes from your MikeOS account (read-only here)."));
+}
+
+// ----- Subscription: honest placeholder (no billing system exists yet) -----
+function subscriptionView() {
+  return el("div", {},
+    el("div", { class: "view-head" }, el("h1", {}, "Subscription")),
+    el("div", { class: "card-panel plan-panel" },
+      el("div", { class: "plan-row" },
+        el("div", {}, el("div", { class: "plan-name" }, "MikeOS — Free"),
+          el("div", { class: "plan-desc" }, "Build, deploy, and host apps on the MikeOS platform.")),
+        el("span", { class: "status-pill s-live" }, "Current")),
+      el("ul", { class: "plan-feats" },
+        el("li", {}, "Full-stack apps (Node + Postgres + Redis), built and deployed for you"),
+        el("li", {}, "A live URL per app on builderapps.osmike.com"),
+        el("li", {}, "Change requests via the update pipeline"))),
+    el("div", { class: "plan-soon" },
+      el("strong", {}, "Plans coming soon."),
+      el("span", {}, " Everything runs on MikeOS infrastructure — there's no paid tier or checkout yet.")));
+}
+
+// Kick off a build from the entry screen: if signed out, run OAuth first (stashing the
+// prompt so we resume after the round-trip), else enter the builder and start streaming.
+function startBuild(prompt) {
+  prompt = (prompt || "").trim();
+  if (!prompt) return;
+  if (!isMock() && !auth.isAuthed()) {
+    try { sessionStorage.setItem(PENDING_KEY, prompt); } catch {}
+    auth.login();
+    return;
+  }
+  goBuilder();               // real /builder path, pushState
+  pushMessage("user", { text: prompt });
+  onCreate(prompt);
 }
 
 function bootScreen() {
@@ -178,14 +434,15 @@ function loginScreen() {
         "Login with MikeOS")));
 }
 
-// Start a fresh, empty project (clears the current one + the chat thread).
+// Start a fresh app: clear the current project + thread and return to the entry screen.
 function newProject() {
   state.project = null;
   state.live = null;
   state.messages = [];
   state.previewNonce = 0;
-  render();
-  toast("New app — describe what you want on the left.");
+  state.entryDraft = "";
+  goEntry();               // back to "/" (the focused landing)
+  setTimeout(() => { const ta = document.getElementById("entry-prompt"); if (ta) ta.focus(); }, 30);
 }
 
 // Dropdown of the user's apps + a "New app" button.
@@ -209,7 +466,8 @@ function projectSwitcher() {
 function topbar() {
   const u = isMock() ? { name: "Demo user (mock)" } : auth.user();
   return el("div", { class: "topbar" },
-    el("div", { class: "brand" },
+    el("div", { class: "brand", role: "button", title: "Home", style: "cursor:pointer",
+      onclick: () => goEntry() },
       el("div", { class: "logo" }, "B"),
       el("span", {}, "MikeOS BuilderApps"),
       isMock() && el("small", {}, "· mock mode")),
@@ -567,29 +825,58 @@ async function openProject(id) {
         : `Opened **${proj.title || id}** (status: ${proj.status || "unknown"}). What should I change?`;
       state.messages = [{ role: "assistant", text: statusLine, steps: [], kind: "" }];
     }
-    render();
+    goBuilder();             // opening an existing project lands in the builder view
   });
+}
+
+// Best-effort fetch of the OIDC userinfo for a richer Profile (name/email/avatar).
+async function loadProfile() {
+  if (isMock()) { state.profile = { name: "Demo user (mock)", email: "demo@osmike.com", sub: "mock-sub" }; return; }
+  const t = auth.token();
+  if (!t) return;
+  try {
+    const r = await fetch(CFG.ISSUER + "/oauth/userinfo", { headers: { Authorization: "Bearer " + t } });
+    if (r.ok) { state.profile = await r.json(); if (state.view === "profile") render(); }
+  } catch { /* fall back to token claims */ }
 }
 
 // ---------- boot ----------
 async function boot() {
+  applyTheme();
   render();  // shows boot spinner
 
+  let cameFromCallback = false;
   // If we're on the OAuth callback, finish the exchange first.
   if (location.pathname === "/auth/callback" || new URLSearchParams(location.search).has("code")) {
     if (!isMock()) {
       const ok = await auth.handleCallback();
       history.replaceState(null, "", "/");
+      cameFromCallback = ok;
       if (!ok) { state.booting = false; render(); return; }
     } else {
       history.replaceState(null, "", "/");
     }
   }
 
-  if (!isMock() && !auth.isAuthed()) { state.booting = false; render(); return; }
+  if (!isMock() && !auth.isAuthed()) { state.booting = false; syncViewFromPath(); render(); return; }
 
+  syncViewFromPath();
   await loadProjects();
+  loadProfile();                 // fire-and-forget; Profile view re-reads state.profile
   state.booting = false;
+
+  // Resume a prompt the user submitted before logging in (stashed pre-redirect).
+  let pending = null;
+  try { pending = sessionStorage.getItem(PENDING_KEY); } catch {}
+  if (cameFromCallback && pending) {
+    try { sessionStorage.removeItem(PENDING_KEY); } catch {}
+    render();
+    goBuilder(true);             // replaceState so back doesn't re-trigger
+    pushMessage("user", { text: pending });
+    onCreate(pending);
+    return;
+  }
+
   render();
 }
 
