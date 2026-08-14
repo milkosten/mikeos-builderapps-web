@@ -943,17 +943,17 @@ function activityBeats() {
 // underneath, doing exactly that. Rendered as two separate blocks, the causation is invisible
 // and the pane reads as two unrelated things that happened to occur.
 //
-// The feed only carries the last N beats, so a DM older than the oldest beat still shown is
-// dropped rather than dumped at the top out of context; the full history is the Assistants
-// tab and the API.
+// DMs are NOT clipped to the beat window, and that is deliberate — it was tried the other way
+// and it silently ate the first two messages of the demo exchange, including the one that
+// started it ("Bug #21 is a privacy breach…"). The feed carries the last 6 beats but 40 DMs,
+// so a floor at the oldest beat drops the opening line of any conversation older than six
+// beats and leaves a reply to nothing. Losing the first message of a thread is a bad failure
+// for a messaging feature and a silent one: what remains still reads like a complete
+// exchange. They are small, they are chronological, and they are the context — the beats are
+// what needs a window, not the conversation.
 function assistantTimeline() {
-  const beats = activityBeats();
-  const rows = beats.map((b) => ({ ts: b.ts, beat: b }));
-  const floor = beats.length ? new Date(beats[0].ts || 0).getTime() : 0;
-  for (const d of (state.dms || [])) {
-    if (floor && new Date(d.created_at || 0).getTime() < floor) continue;
-    rows.push({ ts: d.created_at, dm: d });
-  }
+  const rows = activityBeats().map((b) => ({ ts: b.ts, beat: b }));
+  for (const d of (state.dms || []).slice(-30)) rows.push({ ts: d.created_at, dm: d });
   return rows.sort((a, b) => new Date(a.ts || 0) - new Date(b.ts || 0));
 }
 
