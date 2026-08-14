@@ -5,8 +5,15 @@
 //   GET  /api/health                       -> {status, database}
 //   POST /api/projects {prompt, title?}     -> SSE stream (create pipeline)
 //   GET  /api/projects                      -> {projects:[...]}
-//   GET  /api/projects/{id}                 -> project row + latest_run + url
+//   GET  /api/projects/{id}                 -> project row + latest_run(+steps) + messages + url
 //   POST /api/projects/{id}/update {request}-> SSE stream (update pipeline; may 404)
+//   PUT  /api/projects/{id}/messages {messages:[{role,text}]}  -> persist the chat thread
+//   GET  /api/projects/{id}/steps           -> {steps:[...], status} (poll a running run)
+// Workspace tabs (all GET /api/projects/{id}/...; any of them may 404 until the
+// backend ships them — callers MUST degrade to an empty state, never an error):
+//   /docs · /docs/{name} · /files?path= · /file?path= · /database · /secrets[?reveal=1]
+//   /logs?tail= · /commits · /deployments · /qa · /backlog · /routes · /metrics
+//   /cache · /domain · /env   and  POST /lifecycle {action}
 import { auth } from "./auth.js";
 import { mockApi } from "./mock.js";
 
@@ -98,6 +105,9 @@ async function sseRequest(method, path, payload, onEvent) {
   if (err) throw new Error(err);
 }
 
+// Sub-resource helper: GET /api/projects/{id}/<tail>. `tail` may carry a query string.
+const sub = (id, tail) => req("GET", `/api/projects/${encodeURIComponent(id)}/${tail}`);
+
 const live = {
   health:        ()            => req("GET",  "/api/health"),
   listProjects:  ()            => req("GET",  "/api/projects").then((r) => (r && r.projects) || []),
@@ -107,6 +117,32 @@ const live = {
   // Update pipeline — same event shape; may 404 if not deployed yet (caller handles it).
   updateProjectStream: (id, request, onEvent) =>
     sseRequest("POST", `/api/projects/${encodeURIComponent(id)}/update`, { request }, onEvent),
+
+  // --- durable chat thread (server-side source of truth) ---
+  putMessages:   (id, messages) =>
+    req("PUT", `/api/projects/${encodeURIComponent(id)}/messages`, { messages }),
+  // --- poll a run that is still executing (used when the SSE stream is gone) ---
+  projectSteps:  (id)          => sub(id, "steps"),
+
+  // --- workspace tabs ---
+  projectDocs:   (id)          => sub(id, "docs"),
+  projectDoc:    (id, name)    => sub(id, `docs/${encodeURIComponent(name)}`),
+  projectFiles:  (id, path)    => sub(id, `files?path=${encodeURIComponent(path || "")}`),
+  projectFile:   (id, path)    => sub(id, `file?path=${encodeURIComponent(path || "")}`),
+  projectDatabase:    (id)     => sub(id, "database"),
+  projectSecrets:     (id, reveal) => sub(id, "secrets" + (reveal ? "?reveal=1" : "")),
+  projectLogs:        (id, tail)   => sub(id, `logs?tail=${encodeURIComponent(tail || 200)}`),
+  projectCommits:     (id)     => sub(id, "commits"),
+  projectDeployments: (id)     => sub(id, "deployments"),
+  projectQa:          (id)     => sub(id, "qa"),
+  projectBacklog:     (id)     => sub(id, "backlog"),
+  projectRoutes:      (id)     => sub(id, "routes"),
+  projectMetrics:     (id)     => sub(id, "metrics"),
+  projectCache:       (id)     => sub(id, "cache"),
+  projectDomain:      (id)     => sub(id, "domain"),
+  projectEnv:         (id)     => sub(id, "env"),
+  lifecycle:     (id, action)  =>
+    req("POST", `/api/projects/${encodeURIComponent(id)}/lifecycle`, { action }),
 };
 
 // The exported client picks live or mock at module-load time.
