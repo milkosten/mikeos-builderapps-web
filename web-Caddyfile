@@ -12,6 +12,14 @@
 
 	root * /srv/spa
 
+	# The SPA is served straight out of a git checkout that is `git pull`ed in
+	# place, so a deploy changes files under a URL the browser has already seen.
+	# Without an explicit directive Chrome applies HEURISTIC caching and can keep
+	# running an old app.js after a deploy — which looks exactly like a bug that
+	# "isn't fixed". `no-cache` still allows caching, it just forces revalidation,
+	# and the file_server's ETag/Last-Modified make that a cheap 304.
+	header Cache-Control "no-cache"
+
 	# Serve the SPA's own real files from disk when they exist (assets, app.js,
 	# config.js, favicon, …). Everything else is a client-side route.
 	@files file
