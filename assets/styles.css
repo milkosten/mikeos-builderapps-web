@@ -1508,15 +1508,17 @@ button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 
 /* The centred column. Applied to the SCROLLER itself so the scrollbar sits at the panel edge
    where a reader expects it, not inside the text column. */
 .left.discuss .chat-thread {
-  width: 100%; max-width: 780px; margin: 0 auto; padding: 26px 20px 10px; gap: 18px;
+  /* Was 780px, which read as a narrow ribbon on a desktop while the panel beside it sat
+     empty. Doubled, and fluid: use the width the panel actually has. */
+  width: 100%; max-width: 1560px; margin: 0 auto; padding: 26px 28px 10px; gap: 18px;
 }
 .left.discuss .composer {
   background: var(--bg); align-items: center;
 }
-.left.discuss .composer > * { width: 100%; max-width: 780px; }
+.left.discuss .composer > * { width: 100%; max-width: 1560px; }
 .left.discuss .msg .bubble { font-size: 14.5px; line-height: 1.62; }
 .left.discuss .msg.assistant { max-width: 100%; }
-.left.discuss .msg.user .bubble { max-width: 560px; }
+.left.discuss .msg.user .bubble { max-width: min(75%, 1100px); }
 
 /* the room's header */
 .discuss-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
