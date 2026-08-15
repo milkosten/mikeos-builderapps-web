@@ -1508,17 +1508,19 @@ button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 
 /* The centred column. Applied to the SCROLLER itself so the scrollbar sits at the panel edge
    where a reader expects it, not inside the text column. */
 .left.discuss .chat-thread {
-  /* Was 780px, which read as a narrow ribbon on a desktop while the panel beside it sat
-     empty. Doubled, and fluid: use the width the panel actually has. */
-  width: 100%; max-width: 1560px; margin: 0 auto; padding: 26px 28px 10px; gap: 18px;
+  /* Centred column sized around an 800px text measure. NOTE: the bubbles themselves are
+     capped by the global `.msg .bubble { max-width: 300px }` (sized for the builder's narrow
+     380px pane) — widening only this container made the 300px text drift LEFT instead of
+     getting wider. The bubble override below is the one that actually does the work. */
+  width: 100%; max-width: 864px; margin: 0 auto; padding: 26px 28px 10px; gap: 18px;
 }
 .left.discuss .composer {
   background: var(--bg); align-items: center;
 }
-.left.discuss .composer > * { width: 100%; max-width: 1560px; }
-.left.discuss .msg .bubble { font-size: 14.5px; line-height: 1.62; }
+.left.discuss .composer > * { width: 100%; max-width: 864px; }
+.left.discuss .msg .bubble { font-size: 14.5px; line-height: 1.62; max-width: 800px; }
 .left.discuss .msg.assistant { max-width: 100%; }
-.left.discuss .msg.user .bubble { max-width: min(75%, 1100px); }
+.left.discuss .msg.user .bubble { max-width: 800px; }
 
 /* the room's header */
 .discuss-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
