@@ -1217,6 +1217,10 @@ function researchHead(pa) {
   if (pa.considered) bits.push(pa.considered + " projects considered");
   if (pa.seconds) bits.push(Math.round(pa.seconds) + "s");
   if (pa.cost_usd) bits.push("$" + Number(pa.cost_usd).toFixed(3));
+  // WHICH MODEL WROTE THE OFFER. The room runs two of them — Claude for this one judgement
+  // call, Kimi for everything else — so a cost figure with no model beside it is a figure
+  // nobody can check. Shortened because "claude-opus-4-8" is the part that means something.
+  if (pa.proposal_model) bits.push(String(pa.proposal_model).split("/").pop());
   return el("div", { class: "research-head" },
     el("span", { class: "research-title" }, "Research"),
     bits.length ? el("span", { class: "research-meta" }, bits.join(" · ")) : null);
