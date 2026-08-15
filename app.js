@@ -1131,11 +1131,17 @@ function clearQStep(key) {
 // Chips write into the answer field, so the field is the single source of the answer.
 // Single-select replaces it (clicking the chosen chip again clears it); multi-select toggles
 // the option in a comma-separated list.
+// Multi-select is the DEFAULT. Most questions here have several honest answers at once
+// (who it's for, which features matter, what to leave out) and forcing a single choice
+// throws away information we just asked for. A question is single-select only when the
+// model explicitly says so — i.e. when the options genuinely contradict each other.
+function qIsMulti(q) { return q && q.multi !== false; }
+
 function toggleQOption(q, option) {
   const st = state.qStep;
   const a = st.answers[st.i];
   a.skipped = false;
-  if (!q.multi) {
+  if (!qIsMulti(q)) {
     a.text = (a.text.trim().toLowerCase() === option.toLowerCase()) ? "" : option;
   } else {
     const parts = a.text.split(",").map((s) => s.trim()).filter(Boolean);
@@ -1151,7 +1157,7 @@ function isOptionChosen(q, answer, option) {
   const v = (answer.text || "").trim().toLowerCase();
   const o = option.toLowerCase();
   if (!v) return false;
-  return q.multi ? v.split(",").map((s) => s.trim()).includes(o) : v === o;
+  return qIsMulti(q) ? v.split(",").map((s) => s.trim()).includes(o) : v === o;
 }
 
 function goQStep(i) {
@@ -1360,13 +1366,13 @@ function questionStepper(m, idx) {
       opts.appendChild(el("button", {
         class: "q-opt" + (rec ? " rec" : "") + (on ? " sel" : ""),
         "aria-pressed": on ? "true" : "false",
-        title: q.multi ? "Pick as many as apply" : (rec ? "Recommended" : "Choose this"),
+        title: qIsMulti(q) ? "Pick as many as apply" : (rec ? "Recommended" : "Choose this"),
         onclick: () => toggleQOption(q, o) },
         o, rec ? el("span", { class: "q-rec" }, "recommended") : null));
     }
     body.appendChild(opts);
     body.appendChild(el("div", { class: "q-free" },
-      q.multi ? "Pick as many as apply — or write your own answer below."
+      qIsMulti(q) ? "Pick as many as apply — or write your own answer below."
               : "Or ignore the options entirely and write your own answer."));
   }
 
