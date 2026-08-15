@@ -135,10 +135,20 @@ const live = {
   listDiscussions:  ()           => req("GET",  "/api/discussions")
                                       .then((r) => (r && r.discussions) || []),
   getDiscussion:    (id)         => req("GET",  `/api/discussions/${encodeURIComponent(id)}`),
-  // Chips and typed text go through the SAME endpoint: what was decided must read the same
-  // in the thread whether it was clicked or written.
+  // Typed text and a submitted ANSWER SET go through the SAME endpoint, because both are one
+  // user turn: what was decided must read the same in the thread whether it was clicked or
+  // written. `answers` is [{q, answer, skipped}] — the WHOLE questionnaire, submitted once.
+  // There is deliberately no way to post a single answer: that was the bug (one chip click
+  // posted as a complete turn, and the model invented the rest of the set).
   sayDiscussion:    (id, text)   =>
     req("POST", `/api/discussions/${encodeURIComponent(id)}/messages`, { text }),
+  answerDiscussion: (id, answers) =>
+    req("POST", `/api/discussions/${encodeURIComponent(id)}/messages`, { answers }),
+  // The half-filled questionnaire. A SCRATCHPAD, not a turn: it writes one column, never
+  // reaches the model, and exists only so a reload mid-questionnaire restores like the rest
+  // of this room does.
+  saveAnswerDraft:  (id, draft)  =>
+    req("PUT", `/api/discussions/${encodeURIComponent(id)}/answer_draft`, { draft }),
   // The exact text Build it will send to the pipeline — inspectable BEFORE the build.
   discussionBrief:  (id)         => req("GET", `/api/discussions/${encodeURIComponent(id)}/brief`),
   deleteDiscussion: (id)         => req("DELETE", `/api/discussions/${encodeURIComponent(id)}`),

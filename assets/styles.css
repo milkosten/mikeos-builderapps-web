@@ -1554,6 +1554,86 @@ button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 
    toggle, because the toggle is not reflected on the document element. */
 @media (prefers-reduced-motion: reduce) { .thinking .dot-pulse { animation: none; opacity: .6; } }
 
+/* ----- the stepped questionnaire -----
+   ONE question on screen at a time, tabs to move between them, Submit only on the last step.
+   It sits in the same 800px measure as the bubbles it lives inside, and it is a CARD rather
+   than loose chips because it is a FORM: it has state, a beginning and an end, and until it
+   is submitted nothing has been said. The flat list of chips it replaced read as four
+   independent buttons — which is exactly how it behaved, and exactly what was wrong. */
+.q-stepper {
+  margin-top: 16px; max-width: 800px;
+  border: 1px solid var(--border-2); border-radius: 14px;
+  background: var(--panel-2); overflow: hidden;
+}
+.q-tabs {
+  display: flex; gap: 6px; padding: 9px 10px; overflow-x: auto; scrollbar-width: thin;
+  border-bottom: 1px solid var(--border); background: rgba(0,0,0,.12);
+}
+.q-tab {
+  flex: 0 0 auto; cursor: pointer; font: inherit; font-size: 12px; line-height: 1;
+  display: inline-flex; align-items: center; gap: 6px; padding: 7px 11px;
+  border-radius: 999px; border: 1px solid var(--border-2);
+  background: transparent; color: var(--text-mute);
+  transition: color .15s, border-color .15s, background .15s;
+}
+.q-tab:hover { color: var(--text); border-color: var(--accent); }
+.q-tab-n {
+  font-weight: 800; font-size: 10.5px; min-width: 16px; height: 16px; border-radius: 999px;
+  display: inline-grid; place-items: center; background: var(--border-2); color: var(--text);
+}
+.q-tab-lbl { white-space: nowrap; }
+.q-tab-mark { font-size: 11px; font-weight: 800; }
+.q-tab.done { color: var(--text); border-color: rgba(74,222,128,.45); }
+.q-tab.done .q-tab-mark { color: #4ade80; }
+.q-tab.skip { color: var(--text-dim); border-style: dashed; }
+.q-tab.cur { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.q-tab.cur .q-tab-n { background: rgba(0,0,0,.28); color: #fff; }
+.q-tab.cur .q-tab-lbl, .q-tab.cur .q-tab-mark { color: var(--accent-ink); }
+
+.q-body { padding: 15px 17px 14px; }
+.q-progress {
+  font-size: 11px; font-weight: 800; letter-spacing: .6px; text-transform: uppercase;
+  color: var(--text-mute); margin-bottom: 7px;
+}
+.q-q { font-weight: 650; font-size: 15.5px; line-height: 1.45; }
+.q-stepper .q-why { margin: 6px 0 0; }
+.q-stepper .q-opts { margin: 12px 0 0; }
+.q-stepper .q-free { display: block; margin: 9px 0 0; }
+.q-opt.sel {
+  border-color: var(--accent); background: rgba(109,139,255,.22); color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(109,139,255,.35);
+}
+/* ALWAYS PRESENT, options or not: the chips fill this field, and this field is what is sent. */
+.q-answer {
+  display: block; width: 100%; margin-top: 10px; resize: vertical; min-height: 46px;
+  font: inherit; font-size: 13.5px; line-height: 1.55; padding: 9px 11px;
+  color: var(--text); background: var(--bg); border: 1px solid var(--border-2);
+  border-radius: 10px; outline: none;
+}
+.q-answer:focus { border-color: var(--accent); }
+.q-answer::placeholder { color: var(--text-mute); }
+.q-skipped-note { margin-top: 8px; font-size: 12px; color: var(--text-mute); font-style: italic; }
+.q-foot {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 11px 14px; border-top: 1px solid var(--border); background: rgba(0,0,0,.10);
+}
+.q-foot .spacer { flex: 1 1 auto; }
+.q-foot-note { font-size: 11.5px; color: var(--text-mute); }
+.q-skip { color: var(--text-mute); }
+
+/* A question set that has already been answered: the record of what was asked. Read-only —
+   the answers are in the user turn directly below it. */
+.q-list.asked { opacity: .72; }
+.q-asked-opts { margin: 5px 0 0 26px; font-size: 12px; color: var(--text-mute); }
+
+/* The submitted set, in the user's own bubble: every question and what was chosen. A skip
+   stays visible — that is the difference between a transcript and a summary. */
+.a-list { display: flex; flex-direction: column; gap: 10px; }
+.a-item { border-left: 2px solid rgba(255,255,255,.25); padding-left: 10px; }
+.a-q { font-size: 12.5px; opacity: .78; line-height: 1.45; }
+.a-a { font-size: 14px; font-weight: 600; margin-top: 2px; line-height: 1.5; }
+.a-item.skipped .a-a { font-weight: 400; font-style: italic; opacity: .7; }
+
 /* ----- multi-choice questions ----- */
 .q-list { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
 .q-item {

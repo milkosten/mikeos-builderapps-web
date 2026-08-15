@@ -41,6 +41,10 @@ const state = {
   discussError: "",
   canvasOpen: true,       // the right-hand project canvas (collapsible)
   discussBuilding: false, // Build it was pressed; the brief is being composed server-side
+  // THE STEPPED QUESTIONNAIRE. One question on screen at a time, every answer held HERE
+  // until Submit — see "the answer set" below for why nothing may be posted before then.
+  //   { key, i, questions:[...], answers:[{text,skipped}], ts }
+  qStep: null,
 
   // ----- builder workspace tabs (right panel) -----
   tab: "site",        // active tab id
@@ -876,9 +880,9 @@ function startBuild(prompt) {
 //      conversation, including while the model is still writing. Someone who has seen enough
 //      after one turn is not wrong, and a "finish the questions first" gate would make this
 //      screen an obstacle instead of an offer.
-//   2. CHIPS ARE A SHORTCUT, NEVER A CAGE. Clicking an option posts it as the user's own
-//      message through the same endpoint as typing, so the thread records what was decided in
-//      the same words either way — and the composer is always there for "none of these".
+//   2. CHIPS ARE A SHORTCUT, NEVER A CAGE. An option fills the answer field; the field is
+//      always there for "none of these", and what gets submitted is whatever the field says.
+//      The thread records the decision in the same words whether it was clicked or typed.
 //   3. THE SERVER IS THE SOURCE OF TRUTH. Every turn returns the whole discussion and we
 //      adopt it wholesale. A reload rebuilds the identical room from the identical payload,
 //      so the live view and the after-a-refresh view cannot drift apart.
@@ -937,6 +941,11 @@ function resetDiscussion() {
   state.discussBuilding = false;
   state.discussDraft = "";
   state.discussError = "";
+  // The questionnaire belongs to a room. Its half-filled answers stay in localStorage keyed
+  // by that room's id, so leaving and coming back restores them — but the in-memory copy
+  // must go, or the next room would inherit the last one's step and answers.
+  clearTimeout(_qSaveTimer);
+  state.qStep = null;
   _discussSig = null;
 }
 
@@ -979,22 +988,23 @@ async function loadDiscussions() {
 }
 
 // ----- one exchange -------------------------------------------------------
-async function sendDiscussMessage(text) {
-  text = (text || "").trim();
-  if (!text || state.discussThinking) return;
+// `payload` is EITHER {text} (the composer) or {answers} (the whole questionnaire). Both are
+// one user turn; there is no third shape, and in particular no "one answer" shape.
+async function sendDiscussTurn(payload, optimistic) {
   const d = state.discussion;
-  if (!d || !d.id) return;              // the opening turn is still in flight
+  if (!d || !d.id || state.discussThinking) return;   // opening turn still in flight
 
-  state.discussDraft = "";
   state.discussError = "";
-  d.messages = (d.messages || []).concat([{ role: "user", text }]);
+  d.messages = (d.messages || []).concat([optimistic]);
   state.discussThinking = true;
   // CASE 2: the user caused this, so they must SEE their words land — pinned, not jumped
   // once, because the composer collapsing back to one line moves the height a frame later.
   repaintDiscuss("send");
 
   try {
-    const fresh = await api.sayDiscussion(d.id, text);
+    const fresh = payload.answers
+      ? await api.answerDiscussion(d.id, payload.answers)
+      : await api.sayDiscussion(d.id, payload.text);
     if (!state.discussion || state.discussion.id !== d.id) return;   // left the room mid-flight
     state.discussion = fresh;
     state.discussThinking = false;
@@ -1009,12 +1019,183 @@ async function sendDiscussMessage(text) {
   }
 }
 
-// A multi-choice chip. It POSTS THE OPTION AS THE USER'S MESSAGE rather than sending a
-// hidden answer id, so the transcript says "a team" in the same place it would have said it
-// had the user typed it — the thread stays an honest record of what was decided.
-function answerWithChip(option) {
-  if (state.discussThinking) return;
-  sendDiscussMessage(option);
+function sendDiscussMessage(text) {
+  text = (text || "").trim();
+  if (!text || state.discussThinking) return;
+  state.discussDraft = "";
+  sendDiscussTurn({ text }, { role: "user", text });
+}
+
+// ===========================================================================
+// THE ANSWER SET — a stepped questionnaire, submitted once
+//
+// THE BUG THIS REPLACED. Every chip used to post its own option straight down the wire as a
+// complete user turn. The model then saw four questions asked and one line back, and did the
+// only thing a language model does with a half-filled pattern: it completed it. Three answers
+// were invented, their fields were listed in `decided`, and `decided` means AGREED on the
+// canvas — a state that only an explicit revision can leave. One click on one chip froze
+// three decisions the user had never made, and silently dropped a fourth question entirely.
+//
+// So: the questions are now walked one at a time, every answer is held in `state.qStep`, and
+// NOTHING is sent until Submit. On submit the whole set goes as ONE user turn — including the
+// questions that were skipped, marked as skipped, because "not answered" is a fact the model
+// must be told rather than a gap it gets to fill in.
+//
+// Rules that are easy to lose in a refactor:
+//   * The ANSWER FIELD IS THE ANSWER. A chip writes the option into it (a multi-select chip
+//     appends). That way there is exactly one value per question and the transcript says what
+//     the user actually chose, whether they clicked, typed, or clicked and then edited.
+//   * A SKIP IS NOT AN EMPTY ANSWER. It travels as {skipped:true} and is rendered as a skip
+//     in the thread — an empty string posted as an answer is the same failure one level down.
+//   * Build it stays clickable throughout (RULE 1). The questionnaire is an offer, not a gate.
+// ===========================================================================
+const Q_DRAFT_PREFIX = "builderapps_qdraft_";
+
+// The identity of a question set: the room plus the message that asked. A NEW set of
+// questions is a new key, so a stale half-answered form can never be submitted against
+// questions the model has since moved on from.
+function qKey(discussionId, msgIndex) { return `${discussionId}#${msgIndex}`; }
+
+// Which message owns the LIVE questionnaire: the last message in the thread, if it is an
+// assistant turn that asked something. Anything earlier has already been answered (the reply
+// is right there underneath it) and renders as a read-only record instead.
+function liveQuestionIndex(d) {
+  const msgs = (d && d.messages) || [];
+  const i = msgs.length - 1;
+  if (i < 0) return -1;
+  const m = msgs[i];
+  return (m.role === "assistant" && (m.questions || []).length) ? i : -1;
+}
+
+function blankAnswers(questions) {
+  return questions.map(() => ({ text: "", skipped: false }));
+}
+
+// Rebuild `state.qStep` for the live question set, restoring a half-filled form if there is
+// one. The server copy is authoritative for a different browser or a cold tab; the local
+// copy wins when it is NEWER, because the server one is debounced and a reload half a second
+// after a keystroke must not lose that keystroke.
+function ensureQStep(d, msgIndex, questions) {
+  const key = qKey(d.id, msgIndex);
+  if (state.qStep && state.qStep.key === key) return state.qStep;
+
+  const fresh = { key, i: 0, questions, answers: blankAnswers(questions), ts: 0 };
+  const candidates = [];
+  const server = d.draft_answers;
+  if (server && server.key === key) candidates.push(server);
+  try {
+    const raw = localStorage.getItem(Q_DRAFT_PREFIX + key);
+    if (raw) candidates.push(JSON.parse(raw));
+  } catch { /* a corrupt scratchpad must never break the room */ }
+
+  let best = null;
+  for (const c of candidates) {
+    if (!c || !Array.isArray(c.answers) || c.answers.length !== questions.length) continue;
+    if (!best || Number(c.ts || 0) > Number(best.ts || 0)) best = c;
+  }
+  state.qStep = best
+    ? { key, i: Math.min(Math.max(0, Number(best.i) || 0), questions.length - 1),
+        questions,
+        answers: best.answers.map((a) => ({ text: String((a && a.text) || ""),
+                                            skipped: !!(a && a.skipped) })),
+        ts: Number(best.ts || 0) }
+    : fresh;
+  return state.qStep;
+}
+
+let _qSaveTimer = null;
+// Persist the half-filled form. Local first and synchronously (so a reload one keystroke
+// later still has it), server after a beat (so another tab or another machine gets it too).
+// Neither write is a turn: no message, no canvas, no model.
+function saveQStep({ now = false } = {}) {
+  const st = state.qStep;
+  const d = state.discussion;
+  if (!st || !d || !d.id) return;
+  st.ts = Date.now();
+  const body = { key: st.key, i: st.i, ts: st.ts, answers: st.answers };
+  try { localStorage.setItem(Q_DRAFT_PREFIX + st.key, JSON.stringify(body)); } catch { /* full */ }
+  d.draft_answers = body;                     // survives a repaint rebuilt from state
+  if (!api.saveAnswerDraft) return;
+  clearTimeout(_qSaveTimer);
+  const flush = () => { api.saveAnswerDraft(d.id, body).catch(() => { /* local copy stands */ }); };
+  if (now) flush(); else _qSaveTimer = setTimeout(flush, 600);
+}
+
+function clearQStep(key) {
+  clearTimeout(_qSaveTimer);
+  try { localStorage.removeItem(Q_DRAFT_PREFIX + key); } catch { /* */ }
+  if (state.discussion) state.discussion.draft_answers = {};
+  state.qStep = null;
+}
+
+// Chips write into the answer field, so the field is the single source of the answer.
+// Single-select replaces it (clicking the chosen chip again clears it); multi-select toggles
+// the option in a comma-separated list.
+function toggleQOption(q, option) {
+  const st = state.qStep;
+  const a = st.answers[st.i];
+  a.skipped = false;
+  if (!q.multi) {
+    a.text = (a.text.trim().toLowerCase() === option.toLowerCase()) ? "" : option;
+  } else {
+    const parts = a.text.split(",").map((s) => s.trim()).filter(Boolean);
+    const at = parts.findIndex((p) => p.toLowerCase() === option.toLowerCase());
+    if (at >= 0) parts.splice(at, 1); else parts.push(option);
+    a.text = parts.join(", ");
+  }
+  saveQStep();
+  repaintStepper();
+}
+
+function isOptionChosen(q, answer, option) {
+  const v = (answer.text || "").trim().toLowerCase();
+  const o = option.toLowerCase();
+  if (!v) return false;
+  return q.multi ? v.split(",").map((s) => s.trim()).includes(o) : v === o;
+}
+
+function goQStep(i) {
+  const st = state.qStep;
+  if (!st || i < 0 || i >= st.questions.length) return;
+  st.i = i;
+  saveQStep();
+  repaintStepper();
+}
+
+function skipQStep() {
+  const st = state.qStep;
+  if (!st) return;
+  const a = st.answers[st.i];
+  a.skipped = true;
+  a.text = "";                       // a skip is a skip, not a stale half-answer
+  if (st.i < st.questions.length - 1) st.i += 1;
+  saveQStep();
+  repaintStepper();
+}
+
+// The only thing in this whole flow that talks to the server about answers.
+function submitAnswers() {
+  const st = state.qStep;
+  const d = state.discussion;
+  if (!st || !d || !d.id || state.discussThinking) return;
+  const answers = st.questions.map((q, i) => {
+    const a = st.answers[i] || { text: "", skipped: false };
+    const text = (a.text || "").trim();
+    return { q: q.q, answer: text, skipped: a.skipped || !text };
+  });
+  clearQStep(st.key);
+  sendDiscussTurn({ answers }, { role: "user", answers, text: answersText(answers) });
+}
+
+// The same rendering the server stores as the message text, so the optimistic bubble and the
+// persisted one say the same thing (see discuss.answers_text).
+function answersText(answers) {
+  const lines = ["Answers to your questions:"];
+  answers.forEach((a, i) => {
+    lines.push("\n" + (i + 1) + ". " + a.q);
+    lines.push(a.skipped || !a.answer ? "   (skipped — no answer)" : "   " + a.answer);
+  });
+  return lines.join("\n");
 }
 
 // ----- the room -----------------------------------------------------------
@@ -1065,7 +1246,10 @@ function discussPanel() {
       el("div", { class: "bubble" }, el("div", { class: "hydrating" },
         el("span", { class: "spin sm" }), el("span", {}, "Loading this discussion…")))));
   } else if (d) {
-    for (const m of (d.messages || [])) thread.appendChild(discussBubble(m));
+    // Only the LAST assistant turn's questions are live; everything above it has already
+    // been answered and renders as the record of what was asked.
+    const live = state.discussThinking ? -1 : liveQuestionIndex(d);
+    (d.messages || []).forEach((m, i) => thread.appendChild(discussBubble(m, i === live, i)));
     if (state.discussThinking) thread.appendChild(thinkingBubble());
   }
   if (state.discussError) {
@@ -1084,9 +1268,13 @@ function thinkingBubble() {
         el("span", { class: "thinking-lbl" }, "thinking…"))));
 }
 
-function discussBubble(m) {
+function discussBubble(m, live, idx) {
   if (m.role === "user") {
-    return el("div", { class: "msg user" }, el("div", { class: "bubble" }, m.text));
+    // A submitted answer set is rendered as the Q&A pairs it is — the transcript has to show
+    // what was ASKED next to what was chosen, and a skipped question has to still be visible
+    // as a question nobody answered. `m.text` carries the same thing in prose for the brief.
+    const body = (m.answers && m.answers.length) ? answerRecap(m.answers) : m.text;
+    return el("div", { class: "msg user" }, el("div", { class: "bubble" }, body));
   }
   const bubble = el("div", { class: "bubble" + (m.error ? " error" : "") });
   // PROVENANCE FIRST, above the prose it justifies. A model that quietly absorbs a page and
@@ -1097,7 +1285,9 @@ function discussBubble(m) {
   // "show me the vision" renders the brief INLINE, as a snapshot of what it said at the time
   // — re-rendering today's canvas into an old message would rewrite history on every reload.
   if (m.shown) bubble.appendChild(visionCard(m.show, m.shown));
-  if (m.questions && m.questions.length) bubble.appendChild(questionList(m.questions));
+  if (m.questions && m.questions.length) {
+    bubble.appendChild(live ? questionStepper(m, idx) : askedRecap(m.questions));
+  }
   return el("div", { class: "msg assistant" }, el("div", { class: "avatar" }, "B"), bubble);
 }
 
@@ -1126,30 +1316,150 @@ function visionCard(kind, markdown) {
     el("div", { class: "vision-card-body", html: mdToHtml(markdown) }));
 }
 
-function questionList(questions) {
-  const box = el("div", { class: "q-list" });
+// ----- the live questionnaire: ONE question at a time ---------------------
+// Tabs across the top (click to jump), the current question in the middle, Back / Skip /
+// Next underneath, and Submit answers only on the last step. Nothing here calls the API
+// except `submitAnswers` — that is the whole point of the component.
+function questionStepper(m, idx) {
+  const d = state.discussion;
+  const questions = m.questions;
+  const st = ensureQStep(d, idx, questions);
+  const n = questions.length;
+  const i = Math.min(st.i, n - 1);
+  const q = questions[i];
+  const a = st.answers[i];
+  const last = i === n - 1;
+
+  // The tabs. Each carries its own state so the user can see at a glance what is answered,
+  // what was skipped and what has not been reached — and jump straight to any of them.
+  const tabs = el("div", { class: "q-tabs", role: "tablist" });
+  questions.forEach((qq, k) => {
+    const ans = st.answers[k];
+    const done = !!(ans.text || "").trim();
+    const cls = "q-tab" + (k === i ? " cur" : "") + (done ? " done" : "")
+              + (ans.skipped && !done ? " skip" : "");
+    tabs.appendChild(el("button", { class: cls, role: "tab", "data-q": String(k + 1),
+      "aria-selected": k === i ? "true" : "false",
+      title: qq.q, onclick: () => goQStep(k) },
+      el("span", { class: "q-tab-n" }, String(k + 1)),
+      el("span", { class: "q-tab-lbl" }, "Question " + (k + 1)),
+      done ? el("span", { class: "q-tab-mark" }, "✓")
+           : (ans.skipped ? el("span", { class: "q-tab-mark" }, "–") : null)));
+  });
+
+  const body = el("div", { class: "q-body" },
+    el("div", { class: "q-progress" }, `Question ${i + 1} of ${n}`),
+    el("div", { class: "q-q" }, q.q),
+    q.why ? el("div", { class: "q-why" }, q.why) : null);
+
+  if (q.options && q.options.length) {
+    const opts = el("div", { class: "q-opts" });
+    for (const o of q.options) {
+      const rec = q.recommended && o.toLowerCase() === String(q.recommended).toLowerCase();
+      const on = isOptionChosen(q, a, o);
+      opts.appendChild(el("button", {
+        class: "q-opt" + (rec ? " rec" : "") + (on ? " sel" : ""),
+        "aria-pressed": on ? "true" : "false",
+        title: q.multi ? "Pick as many as apply" : (rec ? "Recommended" : "Choose this"),
+        onclick: () => toggleQOption(q, o) },
+        o, rec ? el("span", { class: "q-rec" }, "recommended") : null));
+    }
+    body.appendChild(opts);
+    body.appendChild(el("div", { class: "q-free" },
+      q.multi ? "Pick as many as apply — or write your own answer below."
+              : "Or ignore the options entirely and write your own answer."));
+  }
+
+  // ALWAYS PRESENT, options or not. The chips fill this field; this field is what is sent.
+  const ta = el("textarea", { class: "q-answer", id: "q-answer", rows: 2,
+    placeholder: "Your answer…" });
+  ta.value = a.text || "";
+  ta.addEventListener("input", () => {
+    a.text = ta.value;
+    a.skipped = false;
+    saveQStep();
+    // Deliberately NO repaint on a keystroke: it would take the caret with it, and the chip
+    // highlight catching up half a word later is not worth a fight with the cursor.
+  });
+  // Flush on blur, but do NOT repaint here: blur fires on the mousedown that is on its way
+  // to a chip or to Next, and replacing the card between mousedown and mouseup swallows the
+  // click on the button the user is in the middle of pressing.
+  ta.addEventListener("blur", () => saveQStep({ now: true }));
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      last ? submitAnswers() : goQStep(i + 1);
+    }
+  });
+  body.appendChild(ta);
+  if (a.skipped && !(a.text || "").trim()) {
+    body.appendChild(el("div", { class: "q-skipped-note" },
+      "Skipped — this will be sent as unanswered, and I'll be told not to guess it."));
+  }
+
+  const foot = el("div", { class: "q-foot" },
+    el("button", { class: "btn ghost sm", disabled: i === 0, title: "Previous question",
+      onclick: () => goQStep(i - 1) }, "← Back"),
+    el("button", { class: "btn ghost sm q-skip", title: "Leave this one unanswered",
+      onclick: () => skipQStep() }, "Skip"),
+    el("div", { class: "spacer" }),
+    el("span", { class: "q-foot-note" },
+      last ? "Nothing is sent until you submit." : "Answers are sent together at the end."),
+    last
+      ? el("button", { class: "btn primary sm", title: "Send all your answers",
+          onclick: () => submitAnswers() }, "Submit answers")
+      : el("button", { class: "btn primary sm", title: "Next question",
+          onclick: () => goQStep(i + 1) }, "Next question →"));
+
+  return el("div", { class: "q-stepper", id: "q-stepper" }, tabs, body, foot);
+}
+
+// Replace just the card. A full panel repaint would work — the card rebuilds from
+// `state.qStep`, which is the source of truth — but it would also scroll and re-lay the
+// whole thread on every chip click, which is the per-tick repaint this room keeps banning.
+function repaintStepper() {
+  const old = document.getElementById("q-stepper");
+  const d = state.discussion;
+  if (!old || !d) { repaintDiscuss("send"); return; }
+  const i = liveQuestionIndex(d);
+  if (i < 0) { repaintDiscuss("send"); return; }
+  const focused = document.activeElement && document.activeElement.id === "q-answer";
+  const caret = focused ? document.activeElement.selectionStart : 0;
+  old.replaceWith(questionStepper(d.messages[i], i));
+  if (focused) {
+    const ta = document.getElementById("q-answer");
+    if (ta) { ta.focus(); ta.setSelectionRange(caret, caret); }
+  }
+}
+
+// A question set that has already been answered: the record of what was asked, with the
+// options that were on offer. Read-only — the answers are in the user turn right below it,
+// and a second way to answer an old set is how a thread stops being a transcript.
+function askedRecap(questions) {
+  const box = el("div", { class: "q-list asked" });
   questions.forEach((q, i) => {
     const item = el("div", { class: "q-item" },
       el("div", { class: "q-head" },
         el("span", { class: "q-num" }, String(i + 1)),
         el("span", { class: "q-text" }, q.q)));
-    if (q.why) item.appendChild(el("div", { class: "q-why" }, q.why));
     if (q.options && q.options.length) {
-      const opts = el("div", { class: "q-opts" });
-      for (const o of q.options) {
-        const rec = q.recommended && o.toLowerCase() === String(q.recommended).toLowerCase();
-        opts.appendChild(el("button", {
-          class: "q-opt" + (rec ? " rec" : ""),
-          disabled: state.discussThinking,
-          title: rec ? "Recommended — click to answer with this" : "Click to answer with this",
-          onclick: () => answerWithChip(o) },
-          o, rec ? el("span", { class: "q-rec" }, "recommended") : null));
-      }
-      // RULE 2 made visible: the chips are not the whole menu.
-      opts.appendChild(el("span", { class: "q-free" }, "…or just type your own answer"));
-      item.appendChild(opts);
+      item.appendChild(el("div", { class: "q-asked-opts" }, q.options.join(" · ")));
     }
     box.appendChild(item);
+  });
+  return box;
+}
+
+// The user's submitted set, in their own bubble: every question, and what they chose — or
+// that they chose nothing. A skip stays visible; that is the difference between a transcript
+// and a summary.
+function answerRecap(answers) {
+  const box = el("div", { class: "a-list" });
+  answers.forEach((a, i) => {
+    const skipped = a.skipped || !(a.answer || "").trim();
+    box.appendChild(el("div", { class: "a-item" + (skipped ? " skipped" : "") },
+      el("div", { class: "a-q" }, (i + 1) + ". " + a.q),
+      el("div", { class: "a-a" }, skipped ? "skipped — no answer" : a.answer)));
   });
   return box;
 }
@@ -1291,7 +1601,11 @@ function discussSignature() {
       b: state.discussBuilding,
       e: state.discussError,
       m: ((d && d.messages) || []).map((m) => [m.role, m.text, (m.questions || []).length,
+                                               (m.answers || []).length,
                                                (m.sources || []).length, m.show]),
+      // state.qStep is deliberately absent for the same reason as discussDraft: the stepper
+      // repaints ITSELF (repaintStepper), and folding it in here would make every chip click
+      // a full-thread repaint — the per-tick repaint this room has banned twice.
       c: d ? JSON.stringify(d.canvas || {}) : null,
       // state.discussDraft is deliberately absent: it is the one thing a repaint never
       // DELIVERS (the composer re-seeds itself from it), so including it would repaint on

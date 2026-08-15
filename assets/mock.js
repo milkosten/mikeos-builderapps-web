@@ -431,6 +431,48 @@ export const mockApi = {
     return JSON.parse(JSON.stringify(d));
   },
 
+  // The submitted ANSWER SET — one user turn carrying every question, skips included. The
+  // stand-in answers the SET (not the first answer in it) and, like the real room, refuses to
+  // decide anything a skipped question would have settled.
+  async answerDiscussion(id, answers) {
+    await wait(900);
+    const d = discussions.get(id);
+    if (!d) { const e = new Error("not found"); e.name = "NotFoundError"; throw e; }
+    const lines = ["Answers to your questions:"];
+    answers.forEach((a, i) => {
+      lines.push("\n" + (i + 1) + ". " + a.q);
+      lines.push(a.skipped || !a.answer ? "   (skipped — no answer)" : "   " + a.answer);
+    });
+    d.messages.push({ role: "user", text: lines.join("\n"), answers });
+    const answered = answers.filter((a) => !a.skipped && a.answer);
+    const skipped = answers.filter((a) => a.skipped || !a.answer);
+    if (answered.length) d.canvas.audience = mockCell(answered[0].answer.slice(0, 80), true);
+    d.messages.push({
+      role: "assistant",
+      text: `Got all ${answered.length} of those — noted on the canvas.`
+          + (skipped.length
+              ? `\n\nStill open, and I'm not going to guess: ${skipped.map((s) => "**"
+                  + s.q + "**").join(", ")}`
+              : ""),
+      questions: skipped.length
+        ? skipped.map((s) => ({ q: s.q, options: ["you decide", "let's talk about it"],
+                                recommended: "you decide", multi: false,
+                                why: "You skipped this — it still changes the build." }))
+        : [],
+    });
+    d.cost_usd = Number((d.cost_usd + 0.003).toFixed(4));
+    d.turns += 1;
+    d.updated_at = new Date().toISOString();
+    return JSON.parse(JSON.stringify(d));
+  },
+
+  // A scratchpad, not a turn: it stores the half-filled form and nothing else happens.
+  async saveAnswerDraft(id, draft) {
+    const d = discussions.get(id);
+    if (d) d.draft_answers = draft;
+    return { ok: true };
+  },
+
   async discussionBrief(id) {
     await wait(120);
     const d = discussions.get(id);
