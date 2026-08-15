@@ -153,6 +153,24 @@ const live = {
   discussionBrief:  (id)         => req("GET", `/api/discussions/${encodeURIComponent(id)}/brief`),
   deleteDiscussion: (id)         => req("DELETE", `/api/discussions/${encodeURIComponent(id)}`),
 
+  // --- prior art (phase 35): "there is already an open-source one" ---
+  // The scout runs in a container off the OPENING TURN and takes 1-2 minutes, so it is NOT
+  // part of any turn's response — it lands later, and this is how the room finds out.
+  // `status` is the whole state machine: classifying | scouting | proposed | accepted |
+  // declined | skipped | none | failed. Only `proposed` renders anything; `skipped` and
+  // `none` are the quiet, common, CORRECT outcomes and must show nothing at all.
+  priorArt:         (id)         =>
+    req("GET", `/api/discussions/${encodeURIComponent(id)}/prior_art`)
+      .then((r) => (r && r.prior_art) || {}),
+  // One click, both ways. Declining is not a lesser path: it writes the choice to the canvas
+  // and returns, with no model turn and no follow-up question.
+  // `repo` is optional and is a NAME, not a URL — the server resolves it against the
+  // candidates its own scout measured, so the browser can prefer a different one from the
+  // shortlist without ever being the thing that decides what gets cloned.
+  decidePriorArt:   (id, action, repo) =>
+    req("POST", `/api/discussions/${encodeURIComponent(id)}/prior_art`,
+        repo ? { action, repo } : { action }),
+
   // --- durable chat thread (server-side source of truth) ---
   putMessages:   (id, messages) =>
     req("PUT", `/api/projects/${encodeURIComponent(id)}/messages`, { messages }),

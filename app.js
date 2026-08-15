@@ -45,6 +45,11 @@ const state = {
   // until Submit — see "the answer set" below for why nothing may be posted before then.
   //   { key, i, questions:[...], answers:[{text,skipped}], ts }
   qStep: null,
+  // PRIOR ART (phase 35). The scout's verdict lives on `discussion.prior_art` — server truth,
+  // like everything else in this room. THIS is only the in-flight click, so both buttons can
+  // be disabled while the choice is being recorded and an impatient double-click cannot post
+  // two decisions.
+  priorArtDeciding: "",
 
   // ----- builder workspace tabs (right panel) -----
   tab: "site",        // active tab id
@@ -524,7 +529,11 @@ function render() {
     root.appendChild(discussTopbar());
     // The proportions are the other way round from the builder: here the CONVERSATION is the
     // work and the canvas is the margin note, so the thread gets the room.
-    root.appendChild(el("div", { class: "split discuss-split" }, discussPanel(), canvasPanel()));
+    // THREE columns on a desktop: the conversation at its 864px measure, the RESEARCH panel
+    // in the space that was empty beside it, and the canvas. The research column is what the
+    // room does in the background made visible — see `researchPanel`.
+    root.appendChild(el("div", { class: "split discuss-split" },
+      discussPanel(), researchPanel(), canvasPanel()));
     scrollThread();
     restoreComposerFocus(cap);
     return;
@@ -921,6 +930,8 @@ async function openTurn(seed) {
     stampDiscussUrl(disc.id);    // a reload from here rehydrates instead of losing the room
     repaintDiscuss("send");      // the reply is the answer to something the user just did
     loadDiscussions();           // it is a draft in Apps from its first turn
+    // The scout was started server-side when this room was created and is still running.
+    startPriorArtPoll(disc.id);
   } catch (e) {
     state.discussThinking = false;
     if (e instanceof AuthError) {
@@ -946,6 +957,8 @@ function resetDiscussion() {
   // must go, or the next room would inherit the last one's step and answers.
   clearTimeout(_qSaveTimer);
   state.qStep = null;
+  state.priorArtDeciding = "";
+  stopPriorArtPoll();
   _discussSig = null;
 }
 
@@ -962,6 +975,9 @@ async function enterDiscussion(id, { navigate = true } = {}) {
     state.discussion = disc;
     state.discussHydrating = false;
     render();
+    // A room reopened while its scout is still running keeps waiting for it; one whose scout
+    // has already landed does not start a poll it would immediately stop.
+    if (priorArtPending()) startPriorArtPoll(id);
     // CASE 1 of the scroll policy: opening a room lands on the NEWEST message.
     pinThreadToBottom();
   } catch (e) {
@@ -1024,6 +1040,342 @@ function sendDiscussMessage(text) {
   if (!text || state.discussThinking) return;
   state.discussDraft = "";
   sendDiscussTurn({ text }, { role: "user", text });
+}
+
+// ===========================================================================
+// PRIOR ART (phase 35) — "there is already an open-source one"
+//
+// The scout runs in a container off the opening turn and takes 1-2 minutes: far longer than a
+// turn, and on its own clock. So it is NOT part of any response — the room polls for it and
+// the proposal appears when (and only when) there is one.
+//
+// THE UI'S JOB IS RESTRAINT. Three of the six terminal states — `skipped`, `none`, `failed` —
+// render NOTHING AT ALL. The classifier deciding "the pipeline can build this well" is the
+// common case and the correct one, and a card saying "we looked and found nothing" would turn
+// every single build into a moment of doubt for no information. A silent miss costs nothing.
+// ===========================================================================
+let _paTimer = null;
+
+function priorArt() {
+  return (state.discussion && state.discussion.prior_art) || {};
+}
+
+function priorArtPending() {
+  const s = priorArt().status;
+  return s === "classifying" || s === "scouting";
+}
+
+function stopPriorArtPoll() { clearTimeout(_paTimer); _paTimer = null; }
+
+// Polled, not streamed. The room already has no socket, the answer arrives once, and a poll
+// every 6s for at most ~3 minutes is four kilobytes of traffic — the wrong place to spend a
+// WebSocket. It stops itself the moment the status is terminal, and again whenever the user
+// leaves the room, so a forgotten timer cannot outlive its discussion.
+function startPriorArtPoll(id) {
+  stopPriorArtPoll();
+  if (!id || !api.priorArt) return;
+  const started = Date.now();
+  const tick = async () => {
+    if (!state.discussion || state.discussion.id !== id || state.view !== "discuss") {
+      return stopPriorArtPoll();
+    }
+    if (Date.now() - started > 6 * 60 * 1000) return stopPriorArtPoll();  // never forever
+    let pa = null;
+    try { pa = await api.priorArt(id); }
+    catch { /* the scout is a bonus; a failed poll must never surface as an error */ }
+    if (!state.discussion || state.discussion.id !== id) return stopPriorArtPoll();
+    if (pa && pa.status) {
+      state.discussion.prior_art = pa;
+      // CASE 3 of the scroll policy: this arrived on its own clock, so a reader who scrolled
+      // up to re-read something stays exactly where they are.
+      repaintDiscuss("poll");
+      if (pa.status !== "classifying" && pa.status !== "scouting") return stopPriorArtPoll();
+    }
+    _paTimer = setTimeout(tick, 6000);
+  };
+  _paTimer = setTimeout(tick, 4000);
+}
+
+async function decidePriorArt(action, repo) {
+  const d = state.discussion;
+  if (!d || !d.id || state.priorArtDeciding) return;
+  state.priorArtDeciding = action;
+  repaintDiscuss("send");
+  try {
+    const fresh = await api.decidePriorArt(d.id, action, repo);
+    if (!state.discussion || state.discussion.id !== d.id) return;
+    state.discussion = fresh;
+    state.priorArtDeciding = "";
+    repaintDiscuss("send");
+    toast(action === "accept"
+      ? "We'll start from that project and build your features on top."
+      // Declining says one calm sentence and stops. No "are you sure", no follow-up
+      // question, no re-offer — the conversation carries on exactly as it was.
+      : "Fine — we'll build it from scratch.", "ok");
+  } catch (e) {
+    state.priorArtDeciding = "";
+    repaintDiscuss("send");
+    toast((e && e.message) || "Could not record that choice.", "err");
+  }
+}
+
+// ===========================================================================
+// THE RESEARCH PANEL — what the room did in the background, while it did it
+//
+// The scout spends ~50 seconds searching GitHub and cloning five repositories, and until this
+// panel existed every bit of that lived in a container's stderr. The user saw one suggestion
+// and had to take on trust that it was the best of several — and the 50 seconds was dead air.
+//
+// It is LIVE without inventing a streaming channel: the server writes the real queries into
+// `searches` with `results: null` the moment the classifier decides them, and each count fills
+// in when the container reports. Nothing here is a fake progress bar; every row is a thing
+// that was actually done, shown either as pending or as its result.
+//
+// It is also the honest place for the distinction the room kept getting wrong: a PAGE THAT
+// INFORMED THE CONCEPT (ea.com/games/simcity — tells you about the genre) is not a PROJECT YOU
+// COULD BUILD ON (a repository with a licence, a stack and a size). Two sections, never mixed.
+// ===========================================================================
+function researchPanel() {
+  const d = state.discussion;
+  if (!d) return el("div", { class: "research-empty" });
+  const pa = priorArt();
+  const sources = readSources();
+  const searches = pa.searches || [];
+  const cards = pa.research || [];
+  const st = pa.status || "";
+
+  if (!st && !sources.length) {
+    // Before anything has happened. Says what this space is FOR rather than sitting blank.
+    return el("div", { class: "research" },
+      researchHead(pa),
+      el("div", { class: "rs-empty" },
+        el("div", { class: "rs-empty-t" }, "Nothing searched yet"),
+        el("div", {}, "If this looks like something worth not building from scratch, I'll go "
+          + "and find out whether an open-source project already does most of it.")));
+  }
+
+  const body = el("div", { class: "research-body" });
+
+  if (st === "classifying") {
+    body.appendChild(rsSection("Deciding", [
+      el("div", { class: "rs-live" }, el("span", { class: "spin sm" }),
+        el("span", {}, "Working out whether this is worth searching for…"))]));
+  }
+  // THE CLASSIFIER'S ANSWER IS ALWAYS SHOWN, including when it said no. "We did not search,
+  // and here is why" is information; silence in a panel about research is just a gap.
+  if (pa.reason) {
+    body.appendChild(rsSection(st === "skipped" ? "No search — and why" : "What this is", [
+      pa.category ? el("div", { class: "rs-cat" }, pa.category) : null,
+      el("div", { class: "rs-reason" }, pa.reason)]));
+  }
+
+  if (searches.length) {
+    const rows = searches.map((q) => el("div", { class: "rs-q" + (q.results == null ? " pend" : "") },
+      el("code", { class: "rs-q-t" }, q.q),
+      q.results == null
+        ? el("span", { class: "rs-q-n pend" }, q.skipped ? "not run" : "searching…")
+        : el("span", { class: "rs-q-n" }, q.results + (q.results === 1 ? " result" : " results"))));
+    body.appendChild(rsSection("Online searches", rows));
+  }
+
+  if (sources.length) {
+    // Pages the model READ. Kept separate from the candidates on purpose: a product page tells
+    // you about the genre, never about code you can build on.
+    const rows = sources.map((sc) => el("div", { class: "rs-src" + (sc.ok ? "" : " bad") },
+      el("a", { href: sc.url, target: "_blank", rel: "noopener noreferrer" },
+        sc.label || sc.url),
+      el("span", { class: "rs-src-n" },
+        sc.ok ? Number(sc.words || 0).toLocaleString() + " words"
+              : (sc.refused ? "refused" : "could not read"))));
+    body.appendChild(rsSection("Pages read", rows,
+      "Background on the idea — not code we could start from."));
+  }
+
+  if (st === "scouting" && !cards.length) {
+    body.appendChild(rsSection("Open-source candidates", [
+      el("div", { class: "rs-live" }, el("span", { class: "spin sm" }),
+        el("span", {}, pa.phase || "Cloning the best few to look inside them…"))]));
+  }
+  if (cards.length) {
+    body.appendChild(rsSection(
+      "Open-source candidates", cards.map((c) => candidateCard(c, pa)),
+      "Cloned and measured in a sandbox — licence read from the repo, not from its README."));
+  }
+  if (st === "none") {
+    body.appendChild(rsSection("Nothing worth proposing", [
+      el("div", { class: "rs-reason" },
+        "We looked and none of these was a good enough starting point, so we'll build it "
+        + "fresh. Better to say nothing than to hand you a dead repository.")]));
+  }
+  if (pa.error) body.appendChild(rsSection("Problem", [el("div", { class: "rs-reason" }, pa.error)]));
+
+  return el("div", { class: "research" }, researchHead(pa), body);
+}
+
+function researchHead(pa) {
+  const bits = [];
+  if (pa.considered) bits.push(pa.considered + " projects considered");
+  if (pa.seconds) bits.push(Math.round(pa.seconds) + "s");
+  if (pa.cost_usd) bits.push("$" + Number(pa.cost_usd).toFixed(3));
+  return el("div", { class: "research-head" },
+    el("span", { class: "research-title" }, "Research"),
+    bits.length ? el("span", { class: "research-meta" }, bits.join(" · ")) : null);
+}
+
+function rsSection(title, children, note) {
+  const box = el("div", { class: "rs-section" },
+    el("div", { class: "rs-label" }, title),
+    note ? el("div", { class: "rs-note" }, note) : null);
+  for (const c of children) if (c) box.appendChild(c);
+  return box;
+}
+
+// Everything the model actually fetched, across the whole thread. Computed here rather than
+// stored twice: `messages[].sources` is already the durable record of it.
+function readSources() {
+  const out = [], seen = new Set();
+  for (const m of ((state.discussion && state.discussion.messages) || [])) {
+    for (const s of (m.sources || [])) {
+      if (!s || !s.url || seen.has(s.url)) continue;
+      seen.add(s.url);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+// One candidate, as EVIDENCE. Licence first — it is the gate, and it is the fact most likely
+// to matter to someone a year from now.
+function candidateCard(c, pa) {
+  const picked = pa.pick && c.full_name === pa.pick;
+  const rejected = c.verdict === "reject";
+  const decided = pa.status === "accepted" || pa.status === "declined";
+  const facts = [];
+  if (c.language) facts.push(c.language);
+  if (c.has_server) facts.push("own server");
+  else if (c.static_only) facts.push("front-end only");
+  if (c.has_dockerfile) facts.push("Dockerfile");
+  if (c.build_step) facts.push("build step");
+  if (c.loc) facts.push(Number(c.loc).toLocaleString() + " LOC");
+  if (c.dependencies) facts.push(c.dependencies + " deps");
+  if (c.last_commit) facts.push("last commit " + c.last_commit);
+  if (c.repo_mb > 300) facts.push(Math.round(c.repo_mb) + " MB");
+
+  return el("div", { class: "rs-cand " + (c.verdict || "") + (picked ? " picked" : "") },
+    el("div", { class: "rs-cand-top" },
+      el("a", { href: c.url, target: "_blank", rel: "noopener noreferrer",
+                class: "rs-cand-name" }, c.full_name),
+      el("span", { class: "rs-lic " + (rejected && c.blocking === "licence" ? "bad" : "ok") },
+        c.licence || "no licence")),
+    picked ? el("div", { class: "rs-picked" }, "recommended") : null,
+    c.description ? el("div", { class: "rs-cand-desc" }, c.description) : null,
+    el("div", { class: "rs-cand-facts" }, facts.join(" · ")),
+    el("div", { class: "rs-cand-v " + (c.verdict || "") },
+      c.verdict === "adopt" ? "adopt — drops straight in"
+        : c.verdict === "adopt-with-work" ? "adopt with work"
+        : "reject"),
+    c.why ? el("div", { class: "rs-cand-why" }, c.why) : null,
+    // "USE THIS ONE INSTEAD". The panel is the first place the shortlist has ever been
+    // visible, so the moment it is, preferring a different one has to be a click. A rejected
+    // candidate deliberately has no button — and the server refuses it anyway, because a
+    // licence gate that the UI enforces is not a gate.
+    (!rejected && !picked && !decided && pa.status === "proposed")
+      ? el("button", { class: "rs-use", disabled: !!state.priorArtDeciding,
+          onclick: () => decidePriorArt("accept", c.full_name) },
+          "Start from this instead")
+      : null);
+}
+
+// The card. It leads with WHAT IT IS in the user's terms and puts the evidence underneath,
+// because "MIT, Node, has a Dockerfile, last commit 3 months ago, ~4k LOC" is what makes the
+// offer judgeable — and a star count, which is what a lesser version of this would show, is
+// not evidence of anything.
+function priorArtCard() {
+  const pa = priorArt();
+  if (pa.status === "accepted" || pa.status === "declined") return priorArtDecided(pa);
+  if (pa.status !== "proposed" || !pa.candidate) return null;
+
+  const c = pa.candidate || {};
+  const p = pa.proposal || {};
+  const ev = c.evidence || {};
+  const busy = state.priorArtDeciding;
+
+  const facts = el("div", { class: "pa-facts" });
+  const fact = (label, value, title) => {
+    if (!value) return;
+    facts.appendChild(el("div", { class: "pa-fact", title: title || "" },
+      el("span", { class: "pa-fact-k" }, label),
+      el("span", { class: "pa-fact-v" }, value)));
+  };
+  fact("Licence", (c.licence && c.licence.spdx) || "—",
+       "Permissive — it can never make your app copyleft. "
+       + "Found in " + ((c.licence && c.licence.source) || "the repository"));
+  fact("Stack", ev.primary_language
+       + (ev.has_server ? " + its own server" : ev.static_only ? " (front-end)" : ""));
+  fact("Size", ev.loc ? Number(ev.loc).toLocaleString() + " lines" : "");
+  fact("Last commit", (ev.last_commit || "").slice(0, 10));
+  fact("Dependencies", ev.dependencies != null ? String(ev.dependencies) : "");
+  fact("Docker", ev.has_dockerfile ? "ships a Dockerfile" : "we add one");
+
+  const notes = el("ul", { class: "pa-notes" });
+  for (const n of (c.notes || []).slice(0, 7)) notes.appendChild(el("li", {}, n));
+
+  const also = el("div", { class: "pa-also" });
+  for (const o of (pa.also_considered || []).slice(0, 4)) {
+    also.appendChild(el("div", { class: "pa-also-row" },
+      el("a", { href: o.url, target: "_blank", rel: "noopener noreferrer" }, o.full_name),
+      el("span", { class: "pa-also-v " + (o.verdict || "") }, o.verdict || ""),
+      el("span", { class: "pa-also-why" }, o.why || o.headline || "")));
+  }
+
+  return el("div", { class: "pa-card" },
+    el("div", { class: "pa-head" },
+      el("span", { class: "pa-ico", html: "&#9733;" }),
+      el("span", {}, "Someone has already built most of this")),
+    el("div", { class: "pa-body", html: mdToHtml(p.reply || "") }),
+    el("div", { class: "pa-repo" },
+      el("a", { href: c.url, target: "_blank", rel: "noopener noreferrer",
+                class: "pa-repo-name" }, c.full_name || ""),
+      c.verdict === "adopt-with-work"
+        ? el("span", { class: "pa-verdict work" }, "needs some work")
+        : el("span", { class: "pa-verdict adopt" }, "drops straight in")),
+    facts,
+    notes.childNodes.length ? el("details", { class: "pa-detail" },
+      el("summary", {}, "What we actually checked"), notes) : null,
+    also.childNodes.length ? el("details", { class: "pa-detail" },
+      el("summary", {}, `Also looked at ${(pa.also_considered || []).length} other project(s)`),
+      also) : null,
+    el("div", { class: "pa-actions" },
+      el("button", { class: "btn primary", disabled: !!busy,
+        onclick: () => decidePriorArt("accept") },
+        busy === "accept" ? "Setting that up…" : "Yes — start from this"),
+      // ONE CLICK, and it must not feel like a lesser answer. No confirm dialog, no "are you
+      // sure", no reason required.
+      el("button", { class: "btn ghost", disabled: !!busy,
+        onclick: () => decidePriorArt("decline") },
+        busy === "decline" ? "…" : "No — build it fresh")),
+    el("div", { class: "pa-foot" },
+      `Scouted ${pa.considered || 0} project(s) in ${Math.round(pa.seconds || 0)}s `
+      + `for $${Number(pa.cost_usd || 0).toFixed(3)}. `
+      + "If we start from it we deploy it unchanged first, so we find out whether it runs "
+      + "before we build anything on top."));
+}
+
+function priorArtDecided(pa) {
+  const c = pa.candidate || {};
+  if (pa.status === "accepted") {
+    return el("div", { class: "pa-card decided" },
+      el("div", { class: "pa-head" }, el("span", { class: "pa-ico", html: "&#10003;" }),
+        el("span", {}, "Starting from " + (c.full_name || "an existing project"))),
+      el("div", { class: "pa-body" },
+        "We'll import it into your own repository with its history and its "
+        + ((c.licence && c.licence.spdx) || "") + " licence, deploy it unchanged to prove it "
+        + "runs, and then build your features on top."));
+  }
+  // Declined renders one quiet line and nothing else — see the note above the card.
+  return el("div", { class: "pa-declined" },
+    "Building from scratch"
+    + (c.full_name ? " (you declined starting from " + c.full_name + ")" : "") + ".");
 }
 
 // ===========================================================================
@@ -1257,6 +1609,12 @@ function discussPanel() {
     const live = state.discussThinking ? -1 : liveQuestionIndex(d);
     (d.messages || []).forEach((m, i) => thread.appendChild(discussBubble(m, i === live, i)));
     if (state.discussThinking) thread.appendChild(thinkingBubble());
+    // PRIOR ART (phase 35) — pinned to the BOTTOM of the thread, not interleaved by
+    // timestamp. It arrives a minute after the opening turn, so ordering it by when it
+    // landed would slide it under whatever the user typed in the meantime; it is a decision
+    // waiting to be made, and a decision belongs where the eye already is.
+    const paCard = priorArtCard();
+    if (paCard) thread.appendChild(paCard);
   }
   if (state.discussError) {
     thread.appendChild(el("div", { class: "msg assistant" }, el("div", { class: "avatar" }, "B"),
@@ -1525,7 +1883,8 @@ function canvasHasContent() {
   return CANVAS_ROWS.some(([k]) => {
     const v = canvasField(k);
     return Array.isArray(v) ? v.length : !!v;
-  }) || !!canvasField("name");
+  }) || !!canvasField("name")
+    || !!(((state.discussion && state.discussion.canvas) || {}).basis || {}).value;
 }
 
 function canvasPanel() {
@@ -1540,6 +1899,20 @@ function canvasPanel() {
   }
 
   const body = el("div", { class: "canvas-body" });
+  // THE STARTING POINT (phase 35). Written by the user's own click on the prior-art
+  // proposal, never by the model — `basis` is deliberately outside the model's canvas
+  // schema — and shown first, because "this app starts from someone else's project" is the
+  // single fact that changes how everything below it should be read.
+  const bas = ((state.discussion && state.discussion.canvas) || {}).basis;
+  if (bas && bas.value) {
+    const row = el("div", { class: "canvas-row basis" + (bas.adopted ? " adopted" : "") },
+      el("div", { class: "canvas-label" }, "Starting point", agreedTick()));
+    row.appendChild(bas.url
+      ? el("div", { class: "canvas-value" }, bas.value + " — ",
+          el("a", { href: bas.url, target: "_blank", rel: "noopener noreferrer" }, bas.repo))
+      : el("div", { class: "canvas-value" }, bas.value));
+    body.appendChild(row);
+  }
   const name = canvasField("name");
   if (name) {
     body.appendChild(el("div", { class: "canvas-name" }, name,
@@ -1606,6 +1979,19 @@ function discussSignature() {
       h: state.discussHydrating,
       b: state.discussBuilding,
       e: state.discussError,
+      // phase 35: the scout lands on its own clock, so its status (and the in-flight
+      // decision) are what tell the anti-flicker gate that the thread really did change.
+      // phase 35: the scout lands on its own clock, so its status, its live phase, the
+      // searches as their counts fill in, and the candidate list are what tell the
+      // anti-flicker gate that this screen really did change.
+      p: JSON.stringify([(d && d.prior_art && d.prior_art.status) || "",
+                         (d && d.prior_art && d.prior_art.pick) || "",
+                         (d && d.prior_art && d.prior_art.phase) || "",
+                         ((d && d.prior_art && d.prior_art.searches) || [])
+                           .map((q) => [q.q, q.results]),
+                         ((d && d.prior_art && d.prior_art.research) || [])
+                           .map((c) => [c.full_name, c.verdict]),
+                         state.priorArtDeciding || ""]),
       m: ((d && d.messages) || []).map((m) => [m.role, m.text, (m.questions || []).length,
                                                (m.answers || []).length,
                                                (m.sources || []).length, m.show]),
@@ -1641,6 +2027,10 @@ function repaintDiscuss(reason) {
   // The canvas moves with the conversation, and the header carries the running cost.
   const rightOld = document.querySelector(".split > .right");
   if (rightOld) rightOld.replaceWith(canvasPanel());
+  // The research column repaints on the same tick — it is the one thing on this screen that
+  // changes while nobody is typing, which is exactly why it must not wait for a full render.
+  const resOld = document.querySelector(".split > .research, .split > .research-empty");
+  if (resOld) resOld.replaceWith(researchPanel());
   const barOld = document.querySelector(".topbar");
   if (barOld) barOld.replaceWith(discussTopbar());
 
