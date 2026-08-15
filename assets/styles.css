@@ -1797,6 +1797,10 @@ button.aa-who:focus-visible { outline: 2px solid var(--accent); outline-offset: 
   .right.canvas { max-height: 40vh; border-left: 0; border-top: 1px solid var(--border); }
   .right.canvas-collapsed, .right.canvas-empty { display: none; }
   .discuss-title-text { max-width: 140px; }
+  /* The tabs keep their numbers and lose their words: five "Question N" pills scroll off a
+     phone, and a number the user can still count and tap is the part that matters. */
+  .q-tab-lbl { display: none; }
+  .q-foot-note { display: none; }
 }
 /* Between the two the thread gives up its side padding before it gives up the canvas. */
 @media (max-width: 1080px) {
